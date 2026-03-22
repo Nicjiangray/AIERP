@@ -1,4 +1,0 @@
-[embeddings]
-provider = "ollama"
-model = "nomic-embed-text"
-base_url = "http://localhost:11434"
