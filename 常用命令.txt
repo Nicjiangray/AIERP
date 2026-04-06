@@ -1,0 +1,68 @@
+常用命令
+进入数据库：psql -U nicjiang -d aierp
+需要终端在aierp目录里
+
+────────────────────────────────────────
+同步宪法 + 本地 LLM 填 meta 字段中文名（一次执行）
+────────────────────────────────────────
+1）CALL meta.sync_constitution()：清空并重建 meta_fields、同步 meta_tables（表目录与字段行；field_cn 先留空）
+2）scripts/sync_meta_cn.py：用本地 LLM 批量填 meta_fields.field_cn（依赖 .env 里 LLM_*；表级 table_cn 仍主要由 sync_constitution 从库注释等写入）
+
+在项目根目录 aierp 下执行其一即可：
+
+  ./scripts/sync_constitution_and_meta_cn.sh
+
+或一行命令（等价）：
+
+  psql -U nicjiang -d aierp -c "CALL meta.sync_constitution();" && .venv/bin/python scripts/sync_meta_cn.py
+
+（PGUSER / PGDATABASE 可照旧用环境变量覆盖。）
+
+若只需单独跑中文名（已做过 sync_constitution）：
+
+  .venv/bin/python scripts/sync_meta_cn.py
+
+
+一键启动前端+后端（在项目根目录执行）：
+./dev.sh
+
+分别启动（必须在项目根目录 aierp 下执行，否则加载的不是本仓库的 main.py）：
+后端：.venv/bin/python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
+前端：cd frontend && npm run dev
+
+
+命令行是：bash dev.sh
+
+
+激活虚拟环境
+source .venv/bin/activate
+
+执行setup_llm_user.sql语句实例：psql -U nicjiang -d postgres -f /Users/nicjiang/aierp/setup_llm_user.sql
+
+
+查询一个表的格式举例：SELECT column_name, data_type
+FROM information_schema.columns
+WHERE table_schema = 'business'
+AND table_name = 'workflow_steps'
+ORDER BY ordinal_position;
+
+
+端口占用处理：
+原因
+ERROR: [Errno 48] Address already in use 表示 8000 端口已被占用。
+dev.sh 里后端是：uvicorn ... --port 8000。
+本机之前有一个 Python（uvicorn）进程 仍占着 127.0.0.1:8000，所以新的后端起不来。前端的 Vite（5173）不受影响，所以你能看到 Vite 就绪信息。
+
+处理
+已在当前环境对占用 8000 的旧进程执行结束，8000 已释放。请在本机再执行一次：
+
+bash dev.sh
+若以后再遇到同样报错，可在终端执行：
+
+lsof -nP -iTCP:8000 -sTCP:LISTEN
+看 PID，然后：
+
+kill <PID>
+若仍杀不掉，可用 kill -9 <PID>。
+
+提示：用 Ctrl+C 结束 dev.sh 时，有时会留下子进程；退出终端前尽量先停掉 dev，或按上面步骤清掉占用 8000 的进程。

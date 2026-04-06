@@ -52,12 +52,12 @@ CREATE TABLE business.contracts (
 COMMENT ON TABLE  business.contracts               IS '合同主线表，是多个事件的锚点。细节不在这里，在各自的事件里';
 COMMENT ON COLUMN business.contracts.contract_code IS '合同编号，唯一，如：SC-2026-001（销售）/ PC-2026-001（采购）';
 COMMENT ON COLUMN business.contracts.contract_type IS 'sales销售合同 / purchase采购合同';
-COMMENT ON COLUMN business.contracts.customer_id   IS '销售合同关联 meta.customers.id';
-COMMENT ON COLUMN business.contracts.supplier_id   IS '采购合同关联 meta.suppliers.id';
+COMMENT ON COLUMN business.contracts.customer_id   IS '销售合同关联 business.customers.id';
+COMMENT ON COLUMN business.contracts.supplier_id   IS '采购合同关联 business.suppliers.id';
 COMMENT ON COLUMN business.contracts.status        IS 'draft草稿 / active执行中 / completed完成 / cancelled取消';
 COMMENT ON COLUMN business.contracts.created_from  IS '从哪个询价事件升级来的，关联business.events.event_code';
-COMMENT ON COLUMN business.contracts.created_by    IS '创建人，关联meta.employees.id';
-COMMENT ON COLUMN business.contracts.confirmed_by  IS '确认人，关联meta.employees.id';
+COMMENT ON COLUMN business.contracts.created_by    IS '创建人，关联 business.employees.id';
+COMMENT ON COLUMN business.contracts.confirmed_by  IS '确认人，关联 business.employees.id';
 
 -- ------------------------------------------------------------
 -- 3. events 表加 contract_code 字段
