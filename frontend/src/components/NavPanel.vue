@@ -6,6 +6,13 @@
       <span class="logo-name">ERP</span>
     </div>
 
+    <div v-if="auth.currentUser" class="nav-user-bar">
+      <span class="nav-user-name" :title="auth.currentUser.emp_code || ''">{{
+        auth.currentUser.name || auth.currentUser.login_name || '用户'
+      }}</span>
+      <button type="button" class="nav-logout" @click="auth.logout()">退出</button>
+    </div>
+
     <div class="nav-quick">
       <router-link to="/dashboard" class="quick-link" active-class="active">仪表盘</router-link>
       <router-link to="/ai-rules" class="quick-link" active-class="active">AI 规则</router-link>
@@ -25,9 +32,11 @@
 <script setup>
 import { onMounted, ref } from 'vue'
 import { useAppStore } from '../stores/app'
+import { useAuthStore } from '../stores/auth'
 import DataNavPanel from './DataNavPanel.vue'
 
 const store = useAppStore()
+const auth = useAuthStore()
 const apiOk = ref(false)
 
 onMounted(async () => {
@@ -77,6 +86,39 @@ onMounted(async () => {
   font-weight: 300;
   color: var(--text-2);
   letter-spacing: 0.15em;
+}
+
+.nav-user-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.nav-user-name {
+  font-size: 13px;
+  color: var(--text-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.nav-logout {
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--text-3);
+  background: var(--bg-hover);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 4px 10px;
+  cursor: pointer;
+  transition: color var(--transition), background var(--transition);
+}
+.nav-logout:hover {
+  color: var(--text-1);
+  background: var(--bg-active);
 }
 
 .nav-quick {

@@ -1,6 +1,7 @@
 <template>
   <n-config-provider :theme="darkTheme" :theme-overrides="themeOverrides">
-    <div class="app-shell">
+    <LoginView v-if="!auth.currentUser" />
+    <div v-else class="app-shell">
       <NavPanel />
       <main class="main-content">
         <RouterView />
@@ -11,10 +12,19 @@
 </template>
 
 <script setup>
+import { onMounted } from 'vue'
 import { RouterView } from 'vue-router'
 import { NConfigProvider, darkTheme } from 'naive-ui'
 import NavPanel from './components/NavPanel.vue'
 import AiPanel from './components/AiPanel.vue'
+import LoginView from './views/LoginView.vue'
+import { useAuthStore } from './stores/auth'
+
+const auth = useAuthStore()
+
+onMounted(() => {
+  auth.restoreSession()
+})
 
 /** 与 naive-ui 表格/组件一致的全局主题（AiPanel 内 n-data-table 依赖此上下文） */
 const themeOverrides = {

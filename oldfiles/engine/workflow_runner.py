@@ -9,6 +9,7 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Sequence
 
+from engine.collecting import COLLECTING_CUD_INTENTS
 from engine.intent import _normalize_conditions_from_llm, extract_query_params
 from engine.workflow import WorkflowStepError, run_workflow
 from llm.client import chat_with_fallback
@@ -426,20 +427,40 @@ def execute_workflow_for_chat(
         "workflow_context": dict
     }
     """
-    if intent in (
-        "create_simple_entity",
-        "update_simple_entity",
-        "delete_simple_entity",
-        "query_master_data",
-        "create_contract",
-        "update_contract",
-        "delete_contract",
-    ):
+    if intent in COLLECTING_CUD_INTENTS or intent == "free_chat":
         from engine.collecting import run_collecting
 
         context.setdefault("matched_intent", intent)
         context.setdefault("workflow_intent", intent)
         ctx_out = run_collecting(context)
+        reply_text = str(ctx_out.get("reply") or "")
+        raw_data = ctx_out.get("data")
+        if not isinstance(raw_data, dict):
+            raw_data = {}
+        main_rows = raw_data.get("main")
+        sub_rows = raw_data.get("sub")
+        if not isinstance(main_rows, list):
+            main_rows = []
+        if not isinstance(sub_rows, list):
+            sub_rows = []
+        return {
+            "reply": reply_text,
+            "data": {"main": main_rows, "sub": sub_rows},
+            "content": reply_text,
+            "intent": intent,
+            "requiresConfirm": False,
+            "pendingToken": None,
+            "workflow_context": ctx_out,
+        }
+
+    if intent == "query_master_data":
+        from engine.collecting import run_free_chat
+
+        context = dict(context)
+        context.setdefault("matched_intent", intent)
+        context.setdefault("workflow_intent", intent)
+        context.setdefault("free_chat_intent_label", "query_master_data")
+        ctx_out = run_free_chat(context)
         reply_text = str(ctx_out.get("reply") or "")
         raw_data = ctx_out.get("data")
         if not isinstance(raw_data, dict):

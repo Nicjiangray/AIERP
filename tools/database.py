@@ -224,3 +224,36 @@ def update_table(context: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         ctx["error"] = f"update_table: {e}"
     return ctx
+
+
+def get_session_memo(session_id: int) -> Dict[str, Any]:
+    """
+    读取 business.sessions.memo。
+    无此行或 memo 为 NULL 时返回空 dict。
+    """
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT memo FROM business.sessions WHERE id = %s",
+                (session_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return {}
+            raw = row[0]
+            if raw is None:
+                return {}
+            if isinstance(raw, dict):
+                return dict(raw)
+            return {}
+
+
+def update_session_memo(session_id: int, memo_dict: Dict[str, Any]) -> None:
+    """将指定 session 的 memo 整列更新为 memo_dict（覆盖写入）。"""
+    with db_conn() as conn:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE business.sessions SET memo = %s WHERE id = %s",
+                (psycopg2.extras.Json(memo_dict), session_id),
+            )

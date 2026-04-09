@@ -202,17 +202,6 @@
                 ❌ 取消
               </button>
             </div>
-            <div class="msg-feedback-row">
-              <button
-                type="button"
-                class="feedback-icon-btn"
-                :disabled="loading || msg.feedbackDone"
-                :title="msg.feedbackDone ? '已反馈' : '反馈此条回复'"
-                @click="openFeedbackModal(i)"
-              >
-                <span class="feedback-glyph">{{ msg.feedbackDone ? '✓' : '⚑' }}</span>
-              </button>
-            </div>
           </div>
         </template>
 
@@ -270,18 +259,29 @@
           </div>
         </template>
         <div
-          v-if="msg.role === 'assistant'"
-          class="msg-feedback-row"
+          v-if="msg.role === 'assistant' && msg.writePreview"
+          class="msg-write-preview-card"
         >
-          <button
-            type="button"
-            class="feedback-icon-btn"
-            :disabled="loading || msg.feedbackDone"
-            :title="msg.feedbackDone ? '已反馈' : '反馈此条回复'"
-            @click="openFeedbackModal(i)"
-          >
-            <span class="feedback-glyph">{{ msg.feedbackDone ? '✓' : '⚑' }}</span>
-          </button>
+          <div class="msg-confirm-title">请确认以下操作</div>
+          <div class="msg-write-preview-body">{{ msg.writePreview.summary }}</div>
+          <div class="msg-write-preview-actions">
+            <button
+              type="button"
+              class="cancel-write-btn"
+              :disabled="loading"
+              @click="cancelWritePreview(i)"
+            >
+              取消
+            </button>
+            <button
+              type="button"
+              class="confirm-write-btn"
+              :disabled="loading"
+              @click="confirmWritePreview(i)"
+            >
+              确认执行
+            </button>
+          </div>
         </div>
       <div v-if="msg.role === 'assistant' && msg.requiresConfirm" class="confirm-wrap">
         <button class="confirm-btn" @click="confirmOperation" :disabled="loading">
@@ -339,47 +339,14 @@
         </button>
       </div>
     </div>
-
-    <div
-      v-if="feedbackOpen"
-      class="feedback-backdrop"
-      @click.self="closeFeedbackModal"
-    >
-      <div class="feedback-panel" role="dialog" aria-modal="true" @click.stop>
-        <div class="feedback-panel-title">提交反馈</div>
-        <label class="feedback-label">类型</label>
-        <select v-model="feedbackType" class="feedback-select">
-          <option value="bug">Bug</option>
-          <option value="suggestion">建议</option>
-          <option value="other">其它</option>
-        </select>
-        <label class="feedback-label">说明（可选）</label>
-        <textarea
-          v-model="feedbackComment"
-          class="feedback-textarea"
-          rows="3"
-          placeholder="简单描述遇到的问题（可不填）"
-        />
-        <div class="feedback-panel-actions">
-          <button type="button" class="feedback-cancel" @click="closeFeedbackModal">取消</button>
-          <button
-            type="button"
-            class="feedback-submit"
-            :disabled="feedbackSubmitting"
-            @click="submitFeedbackForm"
-          >
-            {{ feedbackSubmitting ? '提交中…' : '提交' }}
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <div v-if="feedbackToast" class="feedback-toast">{{ feedbackToast }}</div>
   </aside>
 </template>
 
 <script setup>
 import { ref, nextTick } from 'vue'
+import { useAuthStore } from '../stores/auth'
+
+const authStore = useAuthStore()
 
 function buildColumnsFromRows(rows) {
   if (!rows?.length) return []
@@ -480,67 +447,41 @@ const chatSessionId = ref(null)
 const lastFrameId = ref(null)
 const lastErrorMessage = ref(null)
 
-const feedbackOpen = ref(false)
-const feedbackTargetIdx = ref(-1)
-const feedbackType = ref('bug')
-const feedbackComment = ref('')
-const feedbackSubmitting = ref(false)
-const feedbackToast = ref('')
-
-function openFeedbackModal(idx) {
-  feedbackTargetIdx.value = idx
-  feedbackType.value = 'bug'
-  feedbackComment.value = ''
-  feedbackOpen.value = true
-}
-
-function closeFeedbackModal() {
-  feedbackOpen.value = false
-}
-
-async function submitFeedbackForm() {
-  if (feedbackSubmitting.value) return
-  const idx = feedbackTargetIdx.value
+function cancelWritePreview(idx) {
   const m = messages.value[idx]
-  feedbackSubmitting.value = true
+  if (!m?.writePreview) return
+  messages.value[idx] = { ...m, writePreview: null }
+}
+
+async function confirmWritePreview(idx) {
+  const m = messages.value[idx]
+  if (!m?.writePreview?.payload || loading.value) return
+  loading.value = true
   try {
-    const payload = {
-      session_id: m?.feedbackSessionId ?? chatSessionId.value ?? null,
-      frame_id: m?.feedbackFrameId ?? lastFrameId.value ?? null,
-      user_id: 2,
-      user_comment: (feedbackComment.value || '').trim(),
-      feedback_type: feedbackType.value,
-      error_message:
-        m?.confirmExecError && typeof m?.content === 'string'
-          ? m.content
-          : lastErrorMessage.value || null,
-      page_url: typeof window !== 'undefined' ? window.location.href : null,
-    }
-    const res = await fetch(`${API_BASE}/ai/feedback`, {
+    const res = await fetch(`${API_BASE}/ai/confirm`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ payload: m.writePreview.payload }),
     })
-    const raw = await res.json().catch(() => ({}))
+    const data = await res.json().catch(() => ({}))
     if (!res.ok) {
-      const detail = raw?.detail || raw?.message || '提交失败'
+      const detail = data?.detail || data?.error || '请求失败'
       throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail))
     }
-    if (messages.value[idx]) {
-      messages.value[idx] = { ...messages.value[idx], feedbackDone: true }
-    }
-    closeFeedbackModal()
-    feedbackToast.value = '反馈已提交，谢谢！'
-    setTimeout(() => {
-      feedbackToast.value = ''
-    }, 3200)
+    messages.value[idx] = { ...m, writePreview: null }
+    const line = data.success
+      ? `✅ 已执行：${data.operation || ''} 表 ${data.table || ''}，id=${data.id ?? ''}`
+      : `❌ 执行失败：${data.error || '未知错误'}`
+    messages.value.push({ role: 'assistant', content: line })
+    await scrollToBottom()
   } catch (e) {
-    feedbackToast.value = `提交失败：${e?.message || e}`
-    setTimeout(() => {
-      feedbackToast.value = ''
-    }, 5000)
+    messages.value.push({
+      role: 'assistant',
+      content: `⚠ 确认执行失败：${e?.message || e}`,
+    })
+    await scrollToBottom()
   } finally {
-    feedbackSubmitting.value = false
+    loading.value = false
   }
 }
 
@@ -548,7 +489,11 @@ async function postAiConfirm(frameId, confirmed) {
   const res = await fetch(`${API_BASE}/ai/confirm`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ frame_id: frameId, confirmed, user_id: 2 }),
+    body: JSON.stringify({
+      frame_id: frameId,
+      confirmed,
+      user_id: authStore.currentUser?.id,
+    }),
   })
   if (!res.ok) {
     const data = await res.json().catch(() => ({}))
@@ -693,6 +638,14 @@ function clearChat() {
   stopGeneration()
   messages.value = []
   pendingFiles.value = []
+  chatSessionId.value = null
+}
+
+/** 从 SSE 首包写入会话 id，后续请求带上才能落库 ai_chat */
+function applySessionFromSseStart(payload) {
+  if (payload.session_id != null && payload.session_id !== undefined) {
+    chatSessionId.value = payload.session_id
+  }
 }
 
 /**
@@ -853,6 +806,7 @@ async function sendMessage(text) {
 
   async function handleStreamPayload(payload) {
     if (payload.type === 'start') {
+      applySessionFromSseStart(payload)
       return
     }
     if (payload.type === 'meta' && payload.patch) {
@@ -918,6 +872,29 @@ async function sendMessage(text) {
         messages.value.push({ role: 'assistant', content: `⚠ ${msg}` })
       }
       await scrollToBottom()
+    } else if (payload.type === 'write_preview') {
+      if (state.assistantIdx >= 0) {
+        const cur = messages.value[state.assistantIdx]
+        messages.value[state.assistantIdx] = {
+          ...cur,
+          writePreview: {
+            summary: payload.summary || '',
+            payload: payload.payload || null,
+          },
+        }
+      }
+      await scrollToBottom()
+    } else if (payload.type === 'write_preview_error') {
+      if (state.assistantIdx >= 0) {
+        const cur = messages.value[state.assistantIdx]
+        messages.value[state.assistantIdx] = {
+          ...cur,
+          content:
+            (cur.content || '') +
+            `\n\n⚠ 写入预览校验失败：${payload.error || '未知错误'}`,
+        }
+      }
+      await scrollToBottom()
     } else if (payload.type === 'done') {
       if (state.assistantIdx >= 0 && payload.data && typeof payload.data === 'object') {
         const cur = messages.value[state.assistantIdx]
@@ -948,6 +925,8 @@ async function sendMessage(text) {
         confirm: false,
         stream: true,
         inviteExpert: inviteExpert.value,
+        user_id: authStore.currentUser?.id,
+        session_id: chatSessionId.value,
       }),
       signal: ac.signal,
     })
@@ -977,9 +956,20 @@ async function sendMessage(text) {
       const reply = data.reply ?? data.content ?? ''
       const tableMain = Array.isArray(data.data?.main) ? data.data.main : []
       const tableSub = Array.isArray(data.data?.sub) ? data.data.sub : []
-      const snapSession = data.session_id ?? chatSessionId.value
-      const snapFrame = data.frame_id ?? lastFrameId.value
-      if (data.confirm_required) {
+      if (data.stage === 'preview' && data.payload) {
+        messages.value.push({
+          role: 'assistant',
+          content: reply || '',
+          tableMain: [],
+          tableSub: [],
+          requiresConfirm: false,
+          pendingToken: null,
+          writePreview: {
+            summary: data.summary || '',
+            payload: data.payload,
+          },
+        })
+      } else if (data.confirm_required) {
         messages.value.push({
           role: 'assistant',
           content: reply || '请确认以下新建内容。',
@@ -991,8 +981,6 @@ async function sendMessage(text) {
           tableSub: [],
           requiresConfirm: false,
           pendingToken: null,
-          feedbackSessionId: snapSession,
-          feedbackFrameId: snapFrame,
         })
       } else {
         messages.value.push({
@@ -1002,8 +990,6 @@ async function sendMessage(text) {
           tableSub,
           requiresConfirm: !!data.requiresConfirm,
           pendingToken: data.pendingToken ?? null,
-          feedbackSessionId: snapSession,
-          feedbackFrameId: snapFrame,
         })
       }
       if (tableMain?.length || tableSub?.length) {
@@ -1058,6 +1044,7 @@ async function confirmOperation() {
 
   async function handleStreamPayload(payload) {
     if (payload.type === 'start') {
+      applySessionFromSseStart(payload)
       return
     }
     if (payload.type === 'meta' && payload.patch) {
@@ -1108,6 +1095,29 @@ async function confirmOperation() {
       messages.value[state.assistantIdx] = {
         ...cur,
         content: (cur.content || '') + (payload.text || ''),
+      }
+      await scrollToBottom()
+    } else if (payload.type === 'write_preview') {
+      if (state.assistantIdx >= 0) {
+        const cur = messages.value[state.assistantIdx]
+        messages.value[state.assistantIdx] = {
+          ...cur,
+          writePreview: {
+            summary: payload.summary || '',
+            payload: payload.payload || null,
+          },
+        }
+      }
+      await scrollToBottom()
+    } else if (payload.type === 'write_preview_error') {
+      if (state.assistantIdx >= 0) {
+        const cur = messages.value[state.assistantIdx]
+        messages.value[state.assistantIdx] = {
+          ...cur,
+          content:
+            (cur.content || '') +
+            `\n\n⚠ 写入预览校验失败：${payload.error || '未知错误'}`,
+        }
       }
       await scrollToBottom()
     } else if (payload.type === 'error') {
@@ -1168,6 +1178,8 @@ async function confirmOperation() {
       confirm: true,
       stream: true,
       inviteExpert: inviteExpert.value,
+      user_id: authStore.currentUser?.id,
+      session_id: chatSessionId.value,
       ...(pendingTok ? { pendingToken: pendingTok } : {}),
     }
 
@@ -1576,124 +1588,27 @@ async function confirmOperation() {
   padding-left: 10px;
 }
 
-.msg-feedback-row {
-  margin-top: 6px;
-  display: flex;
-  justify-content: flex-end;
-}
-.feedback-icon-btn {
-  background: transparent;
-  border: none;
-  color: var(--text-3, #6e7681);
-  cursor: pointer;
-  padding: 2px 6px;
-  border-radius: 4px;
-  font-size: 14px;
-  line-height: 1;
-}
-.feedback-icon-btn:hover:not(:disabled) {
-  color: var(--accent, #58a6ff);
-  background: var(--bg-active, rgba(110, 118, 129, 0.15));
-}
-.feedback-icon-btn:disabled {
-  opacity: 0.45;
-  cursor: default;
-}
-.feedback-glyph {
-  display: inline-block;
-  transform: translateY(-1px);
-}
-
-.feedback-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 1200;
-  background: rgba(0, 0, 0, 0.35);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 16px;
-}
-.feedback-panel {
-  width: min(100%, 360px);
-  background: var(--bg, #161b22);
-  border: 1px solid var(--border, #30363d);
-  border-radius: var(--radius, 8px);
-  padding: 14px 16px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
-}
-.feedback-panel-title {
-  font-weight: 600;
-  margin-bottom: 10px;
-  font-size: 14px;
-}
-.feedback-label {
-  display: block;
-  font-size: 12px;
-  color: var(--text-2);
-  margin-bottom: 4px;
-}
-.feedback-select {
-  width: 100%;
-  margin-bottom: 10px;
-  padding: 6px 8px;
-  border-radius: 6px;
-  border: 1px solid var(--border);
-  background: var(--bg-active);
-  color: inherit;
-}
-.feedback-textarea {
-  width: 100%;
-  box-sizing: border-box;
-  margin-bottom: 12px;
-  padding: 8px;
-  border-radius: 6px;
-  border: 1px solid var(--border);
-  background: var(--bg-active);
-  color: inherit;
-  resize: vertical;
-  min-height: 72px;
-  font-family: inherit;
-  font-size: 13px;
-}
-.feedback-panel-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-}
-.feedback-cancel {
-  padding: 6px 12px;
-  border-radius: 6px;
-  border: 1px solid var(--border);
-  background: transparent;
-  color: inherit;
-  cursor: pointer;
-}
-.feedback-submit {
-  padding: 6px 14px;
-  border-radius: 6px;
-  border: none;
-  background: var(--accent);
-  color: var(--bg);
-  cursor: pointer;
-}
-.feedback-submit:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-.feedback-toast {
-  position: fixed;
-  bottom: 24px;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 1300;
-  padding: 10px 16px;
-  border-radius: 8px;
+/* 写入预览（preview_write） */
+.msg-write-preview-card {
+  margin-top: 10px;
+  padding: 12px 14px;
   background: var(--bg-active);
   border: 1px solid var(--border-hi);
+  border-radius: var(--radius, 8px);
+  max-width: 100%;
+}
+.msg-write-preview-body {
   font-size: 13px;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
-  max-width: 90vw;
+  line-height: 1.6;
+  color: var(--text-1);
+  margin: 6px 0 12px;
+  white-space: pre-wrap;
+}
+.msg-write-preview-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
 }
 
 /* 新建实体 — 待确认写入卡片（与 msg-plain-table 同系） */

@@ -21,15 +21,34 @@ from engine.field_normalization import normalize_products_category
 from engine.tool_executor import execute_tool_call
 from engine.turns import get_recent_turns_sync
 from llm.client import chat_with_fallback, chat_with_tools
-from tools.database import db_conn, db_conn_llm
+from tools.database import (
+    db_conn,
+    db_conn_llm,
+    get_session_memo,
+    update_session_memo,
+)
 
 logger = logging.getLogger(__name__)
 
 # 与 main._sync_ai_confirm 取消分支 DELETE … source = %s 对齐，仅清理预览写入
 SLOT_SOURCE_AGENT_PREVIEW = "agent_preview"
 
+# create/update/delete 类 collecting（与 main / workflow_runner 分流一致）
+COLLECTING_CUD_INTENTS = frozenset(
+    {
+        "create_simple_entity",
+        "update_simple_entity",
+        "delete_simple_entity",
+        "create_contract",
+        "update_contract",
+        "delete_contract",
+    }
+)
+_FREE_CHAT_TOOL_NAMES = ("query_db", "ask_user")
+
 _IDENT = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 _JSON_FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
+_MEMO_BLOCK = re.compile(r"<memo>\s*([\s\S]*?)\s*</memo>", re.IGNORECASE)
 
 
 def _validate_ident(name: str) -> bool:
@@ -95,6 +114,51 @@ def _format_messages_history_for_prompt(raw: Any) -> str:
         return ""
     inner = " ".join(lines)
     return f"对话历史供参考：[{inner}]"
+
+
+def _try_apply_memo_from_assistant_text(
+    session_id: Optional[int], assistant_content: Optional[str]
+) -> None:
+    """
+    从助手正文提取 <memo>...</memo> 内 JSON，成功则浅合并写入 sessions.memo；
+    无块、解析失败或非对象时不改库、不抛错。
+    """
+    if session_id is None:
+        return
+    text = (assistant_content or "").strip()
+    if not text:
+        return
+    m = _MEMO_BLOCK.search(text)
+    if not m:
+        return
+    raw_json = (m.group(1) or "").strip()
+    if not raw_json:
+        return
+    try:
+        obj = json.loads(raw_json)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(obj, dict):
+        return
+    try:
+        sid = int(session_id)
+        cur = get_session_memo(sid)
+        update_session_memo(sid, {**cur, **obj})
+    except Exception:
+        logger.debug("collecting: session memo 写入跳过", exc_info=True)
+
+
+def _collecting_memo_prompt_suffix() -> str:
+    return (
+        "\n\n---\n"
+        "【会话记忆 memo】若本轮涉及业务要点（如客户、产品、合同、数量、价格、用户意图等），"
+        "请在回复末尾追加一段（纯闲聊可不输出）：\n"
+        "<memo>\n"
+        '{"entities": {...}, "facts": {...}, "hints": {...}}\n'
+        "</memo>\n"
+        "其中 entities / facts / hints 为 JSON 对象，按需填写键值；整段必须是合法 JSON。"
+        "不要在此块外重复大段结构化数据。"
+    )
 
 
 def _parse_llm_json_object(text: str) -> Dict[str, Any]:
@@ -535,12 +599,35 @@ def get_or_create_frame(workflow_ctx: Dict[str, Any]) -> Dict[str, Any]:
                     meta = _get_meta_table_row_any("contracts")
                 ctx["table_cn"] = (meta.get("table_cn") if meta else "") or ""
             else:
-                if matched == "query_master_data":
+                if matched in ("query_master_data", "free_chat"):
                     ctx["target_table"] = ""
                     ctx["table_cn"] = ""
                 else:
                     raise ValueError("会话数据不完整（缺少目标表），请重新开始。")
             return ctx
+
+    if matched == "free_chat":
+        subject = "自由对话"
+        snap = json.dumps({"target_table": ""}, ensure_ascii=False)
+        with db_conn() as conn:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO business.frames
+                        (workflow_intent, user_id, status, subject, session_id, context_snapshot)
+                    VALUES (%s, %s, 'collecting', %s, %s, %s::jsonb)
+                    RETURNING id
+                    """,
+                    (matched, user_id, subject, session_id, snap),
+                )
+                new_id = cur.fetchone()[0]
+        fid = int(new_id)
+        ctx["frame_id"] = fid
+        ctx["target_table"] = ""
+        ctx["table_cn"] = ""
+        ctx["subject"] = subject
+        return ctx
 
     if matched == "query_master_data":
         preset = (ctx.get("target_table") or "").strip()
@@ -1123,8 +1210,10 @@ def _build_collecting_system_prompt(ctx: Dict[str, Any]) -> str:
             wi,
             len(steps_db),
         )
-        return _build_system_prompt_from_context_schema(ctx, schema, steps_db)
-    return _build_collecting_system_prompt_legacy(ctx)
+        base = _build_system_prompt_from_context_schema(ctx, schema, steps_db)
+    else:
+        base = _build_collecting_system_prompt_legacy(ctx)
+    return base + _collecting_memo_prompt_suffix()
 
 
 def _build_collecting_system_prompt_legacy(ctx: Dict[str, Any]) -> str:
@@ -1260,6 +1349,13 @@ def _build_collecting_system_prompt_legacy(ctx: Dict[str, Any]) -> str:
             "通过 query_db 执行查询，必要时用 ask_user 追问。"
             "（工具列表由系统注入，本场景请勿使用写库类工具。）"
         )
+    elif wi == "free_chat":
+        principles = (
+            "你在与用户自由对话：可闲聊、分析、建议；涉及业务数据时用 query_db 只读查询（business/meta），"
+            "需要澄清时用 ask_user；需按 workflow 持久化要点时用 submit。不必每轮都调用工具。"
+        )
+        task_title = "自由对话（collecting）"
+        tool_line = "通过工具 query_db、submit、ask_user 完成。"
     else:
         principles = (
             "原则：能从用户本轮及历史输入中可靠推断的字段请自行填入 submit 的 data.fields；"
@@ -1892,6 +1988,214 @@ def _most_recent_tool_message_was_error(messages: List[Dict[str, Any]]) -> bool:
     return False
 
 
+def _build_free_chat_system_prompt() -> str:
+    return (
+        "你是 AI·ERP 系统的助手。你可以在对话中调用工具：\n"
+        "- query_db：执行单条只读 SELECT（business / meta schema），用于核实数据、列表、统计；\n"
+        "- ask_user：信息不足或存在歧义时向用户追问。\n"
+        "不要编造查询结果；需要库中数据时务必先 query_db。\n"
+        "本模式无 workflow_steps / collecting frame 约束，用自然、专业中文回复。\n"
+        + _collecting_memo_prompt_suffix()
+    )
+
+
+def run_free_chat(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    轻量对话：仅 query_db + ask_user，不建 frame、不加载 workflow_steps。
+    上下文：sessions.memo 拼入 system；本轮仅 user_input/user_text 一条，不加载 turns 历史。
+    返回结构与 execute_workflow_for_chat（run_collecting 分支）一致。
+    """
+    try:
+        ctx = dict(ctx)
+        ctx.setdefault("data", {"main": [], "sub": []})
+        session_id = ctx.get("session_id")
+        intent_label = (ctx.get("free_chat_intent_label") or "query_master_data").strip() or "query_master_data"
+
+        system_prompt = _build_free_chat_system_prompt()
+        memo: Dict[str, Any] = {}
+        if session_id is not None:
+            memo = get_session_memo(int(session_id))
+        if not isinstance(memo, dict):
+            memo = {}
+        try:
+            memo_blob = json.dumps(memo, ensure_ascii=False)
+        except (TypeError, ValueError):
+            memo_blob = "{}"
+        system_prompt = (
+            system_prompt
+            + "\n\n【本会话已保存的记忆（sessions.memo，只读上下文）】\n"
+            + memo_blob
+        )
+
+        user_text = (ctx.get("user_input") or ctx.get("user_text") or "").strip()
+        user_body = user_text if user_text else " "
+        uploaded = ctx.get("uploaded_file_text")
+        if uploaded:
+            user_body = user_body + "\n\n" + str(uploaded)
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_body},
+        ]
+
+        tools_list = load_tools_from_db(filter_names=list(_FREE_CHAT_TOOL_NAMES))
+        max_rounds = 16
+        tool_calls_used = 0
+        max_tools = 10
+        reply_text = ""
+        collecting_end_reason = "max_reached"
+
+        logger.info(
+            "[free_chat.开始] session=%s intent_label=%s",
+            session_id,
+            intent_label,
+        )
+
+        for _round in range(max_rounds):
+            assistant_msg = chat_with_tools(messages, tools_list, prefer_fallback=False)
+            assistant_content = (
+                assistant_msg.get("content") if isinstance(assistant_msg, dict) else None
+            )
+            _try_apply_memo_from_assistant_text(
+                int(session_id) if session_id is not None else None,
+                assistant_content,
+            )
+            logger.info(
+                "[free_chat.memo_debug] session_id=%s content_head=%s",
+                session_id,
+                (assistant_content or "")[:200],
+            )
+            tcs = assistant_msg.get("tool_calls")
+            logger.info(
+                "[free_chat.轮次] round=%s/%s tool_calls=%s",
+                _round + 1,
+                max_rounds,
+                [tc.get("function", {}).get("name") for tc in tcs]
+                if tcs
+                else "NONE",
+            )
+            if not tcs:
+                reply_text = (assistant_content or "").strip() or "好的。"
+                ctx["reply"] = reply_text
+                ctx["status"] = "collecting"
+                collecting_end_reason = "no_tool_calls"
+                break
+
+            messages.append(assistant_msg)
+            stop_loop = False
+            for tc in tcs:
+                if tool_calls_used >= max_tools:
+                    reply_text = "请求过于复杂，请简化后重试。"
+                    ctx["reply"] = reply_text
+                    ctx["status"] = "collecting"
+                    collecting_end_reason = "max_tools_cap"
+                    stop_loop = True
+                    break
+
+                tool_calls_used += 1
+                fn = tc.get("function") or {}
+                name = (fn.get("name") or "").strip()
+                raw_args = fn.get("arguments") or "{}"
+                try:
+                    if isinstance(raw_args, str):
+                        args = json.loads(raw_args) if raw_args.strip() else {}
+                    else:
+                        args = dict(raw_args) if isinstance(raw_args, dict) else {}
+                except json.JSONDecodeError:
+                    args = {}
+
+                tid = (tc.get("id") or "").strip() or f"call_{tool_calls_used}"
+                result = execute_tool_call(name, args)
+                _st_d, _det_d = _collecting_tool_status_detail(name, result)
+                logger.info(
+                    "[free_chat.tool结果] name=%s status=%s detail=%s",
+                    name,
+                    _st_d,
+                    _det_d,
+                )
+
+                if name == "query_db" and isinstance(result, dict) and "error" not in result:
+                    rows = result.get("rows")
+                    if isinstance(rows, list):
+                        ctx.setdefault("data", {"main": [], "sub": []})
+                        ctx["data"]["main"] = list(rows)
+                        ctx["data"].setdefault("sub", [])
+
+                if name == "ask_user" and result.get("status") == "pending_user_reply":
+                    q = (result.get("question") or "").strip()
+                    hint = result.get("hint")
+                    if hint:
+                        reply_text = f"{q}\n{hint}"
+                    else:
+                        reply_text = q or "请补充更多信息。"
+                    ctx["reply"] = reply_text
+                    ctx["status"] = "collecting"
+                    collecting_end_reason = "ask_user"
+                    stop_loop = True
+                    break
+
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tid,
+                        "content": json.dumps(result, ensure_ascii=False, default=str),
+                    }
+                )
+
+            if stop_loop:
+                break
+        else:
+            reply_text = "我需要更多信息，能否重新描述一下需求？"
+            ctx["reply"] = reply_text
+            ctx["status"] = "collecting"
+            collecting_end_reason = "no_reply"
+
+        if not ctx.get("reply"):
+            ctx["reply"] = reply_text or "好的。"
+        ctx["status"] = ctx.get("status") or "collecting"
+
+        logger.info(
+            "[free_chat.结束] session=%s reason=%s",
+            session_id,
+            collecting_end_reason,
+        )
+
+        reply_final = str(ctx.get("reply") or "")
+        raw_data = ctx.get("data")
+        if not isinstance(raw_data, dict):
+            raw_data = {}
+        main_rows = raw_data.get("main")
+        sub_rows = raw_data.get("sub")
+        if not isinstance(main_rows, list):
+            main_rows = []
+        if not isinstance(sub_rows, list):
+            sub_rows = []
+
+        return {
+            "reply": reply_final,
+            "data": {"main": main_rows, "sub": sub_rows},
+            "content": reply_final,
+            "intent": intent_label,
+            "requiresConfirm": False,
+            "pendingToken": None,
+            "workflow_context": ctx,
+        }
+    except Exception as e:
+        logger.exception("[free_chat] 失败: %s", e)
+        ctx_err = dict(ctx) if isinstance(ctx, dict) else {}
+        err_reply = f"处理失败：{e}"
+        ctx_err["reply"] = err_reply
+        ctx_err["status"] = "error"
+        return {
+            "reply": err_reply,
+            "data": {"main": [], "sub": []},
+            "content": err_reply,
+            "intent": (ctx_err.get("free_chat_intent_label") or "未匹配"),
+            "requiresConfirm": False,
+            "pendingToken": None,
+            "workflow_context": ctx_err,
+        }
+
+
 def _collecting_tool_status_detail(name: str, result: Any) -> Tuple[str, str]:
     """供 [collecting.tool结果]：status 与短摘要。"""
     if not isinstance(result, dict):
@@ -1974,6 +2278,10 @@ def run_collecting(ctx: Dict[str, Any]) -> Dict[str, Any]:
 
         for _round in range(max_rounds):
             assistant_msg = chat_with_tools(messages, tools_list, prefer_fallback=False)
+            _try_apply_memo_from_assistant_text(
+                int(session_id) if session_id is not None else None,
+                assistant_msg.get("content") if isinstance(assistant_msg, dict) else None,
+            )
             tcs = assistant_msg.get("tool_calls")
             _names = (
                 [tc.get("function", {}).get("name") for tc in tcs]
@@ -2112,7 +2420,9 @@ def run_collecting(ctx: Dict[str, Any]) -> Dict[str, Any]:
                     wi_loop = (
                         ctx.get("workflow_intent") or ctx.get("matched_intent") or ""
                     ).strip()
-                    if wi_loop == "query_master_data" and isinstance(rows, list):
+                    if wi_loop in ("query_master_data", "free_chat") and isinstance(
+                        rows, list
+                    ):
                         ctx.setdefault("data", {"main": [], "sub": []})
                         ctx["data"]["main"] = list(rows)
                         ctx["data"].setdefault("sub", [])

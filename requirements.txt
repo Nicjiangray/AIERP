@@ -16,3 +16,4 @@ ollama
 pgvector
 bcrypt
 numpy
+sqlparse>=0.5.0

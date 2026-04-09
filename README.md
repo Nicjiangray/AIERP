@@ -1,348 +1,294 @@
-# AI·ERP 仓库说明（由代码扫描生成）
+# AI·ERP（aierp）
 
-**PM / 非技术读者请先读：** [`docs/PM_项目地图.md`](docs/PM_项目地图.md)（业务主流程与协作说明）。  
-**研发主路径清单：** [`docs/技术主路径与整理清单.md`](docs/技术主路径与整理清单.md)。架构与细节以根目录 **`CLAUDE.md`** 为准。
+数据库驱动的 ERP 辅助：FastAPI 后端 + Vue 前端，对话与写入走 PostgreSQL 元数据（constitution）与业务表。
+
+## 版本进度
+
+### V4：记忆系统 + Agent 分工（2026-04-09）
+
+**记忆架构**
+
+- 三层记忆：session 级要点（每次清洗）→ 当日短期记忆（注入时实时拼）→ longterm 长期记忆（压缩任务）
+- 存储表：`business.ai_memory`（`scope`：`session` / `longterm`）
+- 清洗：调 LLM（主配置为 DeepSeek 时走 `LLM_*`；本机 Ollama 主模型时记忆任务走 `FALLBACK_*`）从 `ai_chat` 提取陈述性要点，写入 `ai_memory(scope=session)`
+- 压缩：当日 session 要点 + 旧 longterm → LLM 压缩 → 覆盖 longterm（提示词中约定约 3000 字封顶）
+- 注入：`build_prompt()` 拼装时从 `ai_memory` 拉长期记忆 + 今日 session 要点，注入主助手 system prompt
+
+**Agent 分工**
+
+- **assistant**（主助手）：面向用户对话，注入人格、工具接口、记忆（长期记忆中可含「业务规律」小节）；只知工具调用格式，**不**注入表结构（`schema_shadow` 归 tool_expert）
+- **tool_expert**（工具专家）：注入表结构 + 工具执行细节；**V5** 起主路径为 **orchestrator 截获 `[TOOL]` → tool_expert（多步 SQL）**（见下方 **V5**）
+- **memory_manager**（记忆管理员）：后台逻辑，负责 session 清洗与 longterm 压缩；对应 prompt 为 `on_demand` 拉取
+- **auditor**（审计员）：未实现，规划中
+
+**新增文件**
+
+- `engine/prompt_builder.py`：统一 prompt 拼装 `build_prompt()` / `build_prompt_on_demand()`，按 `agent_role` 从 `meta.prompts` 取静态片段，按 `user_id` 从 `ai_memory` 取动态记忆
+- `engine/memory_manager.py`：`clean_session()` 会话清洗 + `compress_longterm()` 长期压缩
+
+**改造**
+
+- `/ai/chat`：用 `build_prompt('assistant', user_id=...)` 替换硬编码 `CHAT_SYSTEM`；新增会话持久化（自动创建 `ai_sessions`、写入 `ai_chat`，需有效 `user_id` 且存在于 `business.employees`）
+- `meta.prompts`：新增 `agent_role`；`tool_query` / `tool_write` 拆为接口描述（assistant，`tool_*_interface`）与执行细节（tool_expert）
+- `role_rules`：区分「业务数据不可编造」与「对话记忆可参考」，消除与记忆注入的冲突
+
+**新增 API**
+
+- `POST /ai/memory/clean-session`：手动触发 session 清洗
+- `POST /ai/memory/compress-longterm`：手动触发 longterm 压缩
+
+**未完成（留待后续版本）**
+
+- 凌晨 cron 自动压缩
+- 新 session 开启时自动清洗上一 session
+- 业务规律提炼并写入 `meta.prompts`（如 `category=business_rule`）
+- 前端展示记忆与业务规律
+
+> 对话主路径与 SQL 执行方式的演进见 **V5**（统一 `sql_engine`、orchestrator + tool_expert）。
 
 ---
 
-说明：下列内容仅依据仓库内可见文件与代码，不含推测性描述。目录清单来自 `find` 排除 `.venv`、`node_modules`、`.git` 后的路径（含 `__pycache__`、`dist` 等生成物；若不需要可自行忽略）。
+### V5：统一 SQL 引擎 + Orchestrator + 登录（2026-04-09）
+
+**统一 SQL 引擎（`engine/sql_engine.py`）**
+
+- 废弃「结构化 payload → query_engine / write_engine」的主路径；**tool_expert 直接产出可审计的 SQL**（+ `params`），由引擎统一处理。
+- 依赖 **sqlparse** 等做安全审计：白名单表（`include_in_domain_model`）、禁止危险关键字与整表写等。
+- **`execute_sql`**：审核并执行 **SELECT**（含参数化），返回行集摘要。
+- **`preview_sql`**：审核写 SQL，生成中文摘要等，供用户确认（不提交事务）。
+- **`confirm_execute_sql`**：用户确认后执行经预览同一套 SQL（`/ai/confirm` 走此入口）。
+
+**assistant → orchestrator → tool_expert**
+
+- 主助手在回复中输出 **`[TOOL] ... [/TOOL]`** 意图块（自然语言键值对：**不含**表名、字段名），仅表达「要查什么 / 改什么」。
+- **`main.py` 中 orchestrator** 解析该块，将内容作为 user 消息交给 **tool_expert**（`build_prompt('tool_expert')`，含 `schema_shadow` + `tool_expert_executor`）。
+- **tool_expert** 内部多步闭环（最多 **5** 步）：每步输出一个 JSON（`type: query` 调 `execute_sql`，`type: write` 调 `preview_sql`），系统将执行结果贴回对话，直到 `done` 或预览成功；结果以 **`[TOOL_RESULT] ... [/TOOL_RESULT]`** 回注主助手下一轮。
+- **职责**：助手负责业务规划（对用户说话、收信息），**无表结构**；expert 负责操作规划（写 SQL、查 id），**无用户对话上下文**。
+
+**登录系统**
+
+- **`POST /auth/login`**：`business.user_accounts` + **bcrypt** 校验密码；成功返回 `user`（`id` 为 **`employees.id`**）；可选更新 `last_login_at`（见迁移 `v5_auth_employees_last_login.sql`）。
+- **`GET /auth/me?user_id=`**：按员工 id 拉用户信息，供前端刷新恢复。
+- **前端**：`LoginView.vue` + `stores/auth.js`（`localStorage` 键 `aierp_user_id`）；`App.vue` 未登录仅渲染登录页；**`AiPanel` 请求 `/ai/chat` 等的 `user_id` 取自登录态**（无硬编码默认用户 id）。
+
+**Prompt 变更（`meta.prompts`）**
+
+- **`tool_query_interface` / `tool_write_interface`**：重写为**意图级菜单**格式（约定 `[TOOL]` 块，不出现表字段名）。
+- **新增 `tool_expert_executor`**（`agent_role=tool_expert`，`inject_mode=always`）：教 expert 写 **SQL + params**、多步规划与 `done` 结束条件。
+- **`tool_query` / `tool_write`**：**停用**（`is_active=false`），由 SQL 路径与 `tool_expert_executor` 取代。
+
+**相关迁移（节选）**
+
+- `v5_tool_expert_executor_and_assistant_tool_prompts.sql`、`v5_2_sql_engine_tool_expert.sql`、`v5_2_tool_expert_multistep.sql`
+- `v5_auth_employees_last_login.sql`、`v5_seed_xiaowang_account.sql`（测试账号，可选）
+
+**未完成（V5 之后）**
+
+- 端到端测试：受控查询、写入预览与确认、多轮 tool_expert、登录与会话持久化同一条 `user_id`。
+- 凌晨 cron、新 session 清洗、业务规律提炼、前端展示记忆（与 V4 清单衔接，仍待实现）。
 
 ---
 
-## 1. 目录与文件（路径 → 作用）
+## 项目目录结构概览
 
-### 仓库根
+```
+aierp/
+├── main.py                 # FastAPI：表 CRUD、/auth/*、/ai/chat（orchestrator）、/ai/memory/*、/ai/confirm
+├── engine/                 # sql_engine、prompt_builder、memory_manager；query/write_engine 已 deprecated
+├── llm/                    # OpenAI 兼容客户端（chat / 流式 / 附件解析）；intent 为占位
+├── tools/                  # 连接池、通用 DB 读写与会话 memo 等辅助
+├── scripts/                # sync_meta_pipeline、sync_meta_cn、sync_schema_shadow
+├── constitution/           # SQL 迁移与种子（表结构、prompts、ai_memory 等）
+├── frontend/               # Vue 3 + Vite（入口见下方说明）
+│   ├── index.html          # 挂载 /src/main.js
+│   └── src/                # 实际使用的页面与组件（见「前端现状」）
+├── dev.sh                  # 一键前后端
+├── requirements.txt
+├── README.md
+└── 常用命令.txt
+```
 
-| 路径 | 作用 |
+`frontend/` 根目录下另有若干与 `frontend/src/` **同名或重复的 .vue / main.js**（历史拷贝），**以 `frontend/src/` 与 `index.html` 引用的 `/src/main.js` 为准**。
+
+---
+
+本文档用于**快速回忆**：日常命令、迁移顺序、代码与接口现状。更细的命令备忘见 [`常用命令.txt`](./常用命令.txt)。
+
+---
+
+## 后端代码现状（`engine/`）
+
+以下为 **`engine/` 目录下各 `.py` 文件**说明。
+
+| 文件 | 用途简述 | 当前状态 |
+|------|----------|----------|
+| `__init__.py` | 包说明：统一入口为 **`sql_engine`**；`query_engine` / `write_engine` 为历史路径 | 已完成 |
+| **`sql_engine.py`** | **统一 SQL 引擎**：`execute_sql`（SELECT）、`preview_sql`（写预览）、`confirm_execute_sql`（确认执行）；**sqlparse** 审计 + 白名单表 | **主路径**：由 **tool_expert**（经 orchestrator）与 **`/ai/confirm`** 调用 |
+| `query_engine.py` | 旧版：结构化 payload + 白名单的受控 SELECT（`execute_query`） | **deprecated**：不再被 `/ai/chat` 主链路使用；保留文件供对照或迁移 |
+| `write_engine.py` | 旧版：结构化 payload 的预览与写入 | **deprecated**：同上 |
+| `prompt_builder.py` | 统一 prompt 拼装：按 `agent_role` 取 `meta.prompts` + 按 `user_id` 取 `ai_memory` | **已完成**：`assistant` / `tool_expert` / `memory_manager` |
+| `memory_manager.py` | 记忆管理员：`clean_session()`、`compress_longterm()` | **已完成**：手动 API 触发 |
+
+---
+
+## API 路由现状（`main.py`）
+
+路由均定义在 **`main.py` 顶层 `app`**，无独立 `router` 文件。
+
+| 路径 | 方法 | 用途 | 当前状态 |
+|------|------|------|----------|
+| `/` | GET | 健康探测 JSON | 可用 |
+| `/health` | GET | 健康检查 | 可用 |
+| `/tables` | GET | 列出 `meta` / `business` / `ai_assistant` 下基表 | 可用 |
+| `/nav/tables` | GET | 按 `meta.meta_tables` 的 `nav_section` 返回设计/预备/运行导航 | 可用 |
+| `/table-columns/{table_name}` | GET | 从 `meta.meta_fields` 取列与菜单标签 | 可用 |
+| `/table/{schema}/{table_name}` | GET | 分页查询表数据（筛选、排序、`q` 等） | 可用 |
+| `/export/xlsx/{schema}/{table_name}` | GET | 导出 xlsx（依赖 `openpyxl`） | 可用；未装库时 503 |
+| `/table/{schema}/{table_name}` | POST | 按可写字段插入一行 | 可用 |
+| `/table/{schema}/{table_name}/{row_id}` | PATCH | 按 `id` 更新 | 可用（需表有整数 `id`） |
+| `/table/{schema}/{table_name}/{row_id}` | DELETE | 硬删除一行 | 可用 |
+| **`/auth/login`** | **POST** | **body：`{ login_name, password }`**；bcrypt 校验 **`business.user_accounts`**；返回 **`user`**（`id`=`employees.id`） | 可用 |
+| **`/auth/me`** | **GET** | **Query：`user_id`**（员工 id）；返回 **`{ user: {...} }`**，不存在则 404 | 可用 |
+| `/ai/confirm` | POST | 执行经 **`preview_sql`** 审核的写 SQL：**`payload` 须含 `sql`、可选 `params`（数组）** → `confirm_execute_sql` | 可用 |
+| `/ai/chat` | POST | **orchestrator**：`build_prompt('assistant', user_id)` + 流式/非流式 LLM；若回复含 **`[TOOL]`** 则调用 **tool_expert**（多步 `execute_sql` / `preview_sql`），以 **`[TOOL_RESULT]`** 回注；**SSE** 默认；传 **`user_id`** 时自动建 **`ai_sessions`** 并写 **`ai_chat`** | 可用 |
+| `/ai/memory/clean-session` | POST | 手动触发 session 清洗，要点写入 `business.ai_memory`（`scope=session`） | 可用（body：`{"session_id": <int>}`） |
+| `/ai/memory/compress-longterm` | POST | 手动触发长期记忆压缩，覆盖/写入 `scope=longterm` | 可用（body：`{"user_id": <int>}`） |
+| `/ai/chat`（`pendingToken`） | POST | — | **未联通**：显式返回 400，提示不支持恢复 |
+| `/ai/chat`（`confirm: true`） | POST | — | **未联通**：显式返回 400，提示不在此确认 DB |
+
+`user_id` 须能关联 **`business.employees`**，否则插入 `ai_sessions` 会违反外键。
+
+---
+
+## 前端现状（`frontend/src/`）
+
+入口：`index.html` → `/src/main.js` → `App.vue` + `router` + Pinia。
+
+| 路径/文件 | 用途 | 当前状态 |
+|-----------|------|----------|
+| `App.vue` | **`n-config-provider` 包裹**；**未登录**仅 **`LoginView`**；**已登录**为 `NavPanel` + `RouterView` + `AiPanel`；`onMounted` 调用 **`auth.restoreSession()`** | 可用 |
+| **`views/LoginView.vue`** | **登录页**：登录名 + 密码 → **`POST /auth/login`** | 可用 |
+| **`stores/auth.js`** | **`currentUser`**、`login` / `logout` / **`restoreSession`**（`localStorage`：`aierp_user_id`） | 可用 |
+| `router/index.js` | `/dashboard`、`/meta`、`/business`、`/meta/:table`、`/business/:table`、`/ai-rules` | 可用（登录页不走路由，由 `App.vue` 条件渲染） |
+| `stores/app.js` | 请求 `http://localhost:8000` 的 `/tables`、`/nav/tables`、`/table-columns`、`/table/...`、导出 URL、表 CRUD | 可用 |
+| `components/NavPanel.vue` | 侧栏导航；**展示当前用户名 + 退出** | 可用 |
+| `components/DataNavPanel.vue` | 数据侧导航（与表拆分配置配合） | 可用 |
+| `components/AiPanel.vue` | AI 对话：SSE **`/ai/chat`**、**`/ai/confirm`**；请求体 **`user_id` 取自 `useAuthStore().currentUser?.id`**（与登录态一致） | 可用 |
+| `views/DashboardView.vue` | 仪表盘占位 | 可用 |
+| `views/MetaView.vue` / `BusinessView.vue` | 元数据/业务表列表入口 | 可用 |
+| `views/TableView.vue` | 通用表浏览与编辑 | 可用 |
+| `views/AiRulesView.vue` | 展示 `meta.ai_rules` 表数据 | 可用 |
+| `config/tableSplit.js` | 表拆分配置 | 可用 |
+| `utils/tableExport.js` | 导出 xlsx URL 构造 | 可用 |
+
+---
+
+## 已联通 vs 未联通（总结）
+
+- **表数据与导航**：前端 `stores/app.js` ↔ 后端表 API（`/tables`、`/nav/tables`、`/table/...`、导出）**已串通**。
+- **登录**：`LoginView` → **`/auth/login`**；刷新 **`/auth/me`**；**`AiPanel` 携带同一 `user_id`** → **已实现（待测试）**。
+- **对话主链路**：用户输入 → `AiPanel` → `POST /ai/chat`（SSE）→ **`build_prompt('assistant')`** + LLM；若含 **`[TOOL]`** → **orchestrator** → **tool_expert**（多步 **`sql_engine`**）→ **`[TOOL_RESULT]`** 回注 → **已实现（待测试）**。
+- **查询 / 写入（经 tool_expert）**：自然语言意图 → **`[TOOL]`** → expert 产出 **SQL** → `execute_sql` / `preview_sql` → 前端确认 → **`/ai/confirm`**（`sql`+`params`）→ **`confirm_execute_sql`** → **已实现（待测试）**（旧版 `query_engine.execute_query` 与结构化 `preview_write` 主路径已弃用）。
+- **记忆系统**：**已串联（手动触发）**——`clean-session` / `compress-longterm` 写入 `business.ai_memory`；主助手注入长期 + 今日 session 要点；**自动**定时清洗/压缩 **仍待实现**。
+- **会话持久化**：**已联通**——提供有效 **`user_id`**（登录态）时自动建 **`ai_sessions`** 并写 **`ai_chat`**（须满足 `employees` 外键）。
+
+---
+
+## 环境与启动
+
+- **Python**：项目根目录使用虚拟环境 `.venv`（`source .venv/bin/activate`）。
+- **依赖（V5 相关）**：`bcrypt`（登录）、`sqlparse`（`sql_engine` 审计），见根目录 **`requirements.txt`**。
+- **数据库**：默认 `psql -U nicjiang -d aierp`（可用 `PGUSER` / `PGDATABASE` 覆盖）。
+- **一键前后端**：`./dev.sh`（根目录执行；否则可能加载不到本仓库的 `main.py`）。
+- **仅后端**：`.venv/bin/python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000`
+- **仅前端**：`cd frontend && npm run dev`
+- **端口占用**（8000）：`lsof -nP -iTCP:8000 -sTCP:LISTEN` → `kill <PID>`
+
+---
+
+## 元数据流水线（推荐记这一条）
+
+顺序与数据依赖一致：
+
+1. `CALL meta.sync_constitution()` — 从 `information_schema` 重建 `meta_tables` / `meta_fields`
+2. `scripts/sync_meta_cn.py` — 为空 `field_cn` 批量填中文（依赖 `.env` 里 `LLM_*`）
+3. `scripts/sync_schema_shadow.py` — 按 `include_in_domain_model` 裁剪后写入 `meta.prompts`（`prompt_code = schema_shadow`）
+
+一键（根目录）：
+
+```bash
+.venv/bin/python scripts/sync_meta_pipeline.py
+```
+
+等价于「宪法 + 中文名」的旧脚本若仍存在，见 [`常用命令.txt`](./常用命令.txt)。
+
+常用参数：
+
+- `--skip-meta-cn`：不跑 LLM 填中文
+- `--only-schema-shadow`：只重写 `schema_shadow` 那条 prompt
+
+---
+
+## Constitution SQL（`constitution/`）
+
+以下按**常见依赖顺序**排列；新环境或换库时按序执行缺失项即可（具体以各文件头注释为准）。
+
+| 文件 | 作用 |
 |------|------|
-| `main.py` | FastAPI 应用：表 CRUD、导航、xlsx 导出、`/ai/chat` 等 HTTP API |
-| `requirements.txt` | Python 依赖列表 |
-| `dev.sh` | 并行启动根目录 uvicorn（8000）与 `frontend` 的 `npm run dev` |
-| `db_pool.py` | 文件头写明「已迁移至 tools/database.py，待确认后删除」；内含 `psycopg2.pool.ThreadedConnectionPool` 双池与 `db_conn`/`db_conn_llm` |
-| `llm_client.py` | 文件头写明「已迁移至 llm/client.py，待确认后删除」；OpenAI 兼容客户端与 `parse_file` 等 |
-| `llm_tools.py` | 文件头写明「已迁移至 llm/tools.py，待确认后删除」；从 `db_pool` 导入的连接版 LLM 工具链 |
-| `.env` | 本地环境变量（`.gitignore` 忽略；内容未写入本文档） |
-| `.gitignore` | Git 忽略规则 |
-| `.memsearch.toml` | 被 `.gitignore` 引用忽略的配置文件（若存在） |
-| `AI·ERP系统设计概要.txt` | 设计概要文本 |
-| `常用命令.txt` | 人工整理的常用命令说明（与代码路径不完全一致处以仓库实际路径为准） |
+| `sync_constitution.sql` | 定义/注册 `meta.sync_constitution()` 等（若库中尚无） |
+| `create_meta_prompts.sql` | `meta.prompts` 提示词表（含 `agent_role`） |
+| `add_meta_prompts_agent_role.sql` | 旧库：补 `agent_role` + 记忆管理员两条 prompt（新库若已用 `create_meta_prompts.sql` 可跳过） |
+| `create_ai_sessions_and_ai_chat.sql` | `business.ai_sessions` / `business.ai_chat` |
+| `create_business_ai_memory.sql` | `business.ai_memory`（会话要点 / 长期记忆） |
+| `add_meta_tables_include_in_domain_model.sql` | 领域模型裁剪相关列（若使用 schema_shadow） |
+| `seed_prompts_role_rules.sql` | 种子：`role_rules`（含记忆与业务数据措辞区分） |
+| `seed_prompt_tool_query.sql` / `seed_prompt_tool_write.sql` | 历史种子：`tool_query` / `tool_write`（**V5 迁移中可停用**；新环境仍可能先执行再跑 `v5_2_tool_expert_multistep.sql`） |
+| `update_meta_prompts_tool_expert_and_interfaces.sql` | tool_expert 归属 + 主助手 `tool_*_interface` |
+| **`v5_tool_expert_executor_and_assistant_tool_prompts.sql`** | **V5**：新增 **`tool_expert_executor`**；重写 **`tool_query_interface` / `tool_write_interface`**（意图级、`[TOOL]`） |
+| **`v5_2_sql_engine_tool_expert.sql`** | **V5.2**：`tool_expert_executor` 改为 **SQL + params** 单步说明（与 `sql_engine` 对齐） |
+| **`v5_2_tool_expert_multistep.sql`** | **V5.2**：`tool_expert_executor` 最终版——**多步 query/write + `done`**；**停用 `tool_query` / `tool_write`**（`is_active=false`） |
+| **`v5_auth_employees_last_login.sql`** | **V5**：`business.employees.last_login_at`（登录成功时可选更新） |
+| **`v5_seed_xiaowang_account.sql`** | **V5**：测试账号种子（可选） |
+| `update_role_rules_memory_prompt.sql` | 更新 `role_rules` 全文（记忆与数据规则） |
+| `alter_ai_sessions_status_default.sql` | `ai_sessions.status` 默认 `in_progress` |
+| `fix_ai_chat_primary_key_if_wrong.sql` | 若误将 `ai_chat` 主键建在 `session_id` 上则修复为 `id`（正常库为 no-op） |
+| `drop_business_feedback.sql` / `drop_business_sessions_frames_slots_turns.sql` / `nav_workflow_contract_items.sql` | 按需：删旧表或导航种子（见各文件头注释） |
 
-### `constitution/`（SQL）
+执行示例：
 
-| 路径 | 作用（摘自文件头注释） |
-|------|-------------------------|
-| `add_nav_columns_meta_tables.sql` | 为 `meta.meta_tables` 增加导航字段（`nav_section`/`nav_order`/`nav_parent_table`）及种子数据 |
-| `create_auth_tables.sql` | 登录与权限测试数据：`business.user_accounts`、`business.user_role_grants` 等 |
-| `create_design_memories.sql` | 建 `business.design_memories`（设计/架构过程记忆，768 维向量等） |
-| `create_memories_contracts.sql` | 建 `business.memories` 与 `business.contracts` |
-| `register_auth_migration_procedure.sql` | 将认证迁移登记到 `business.procedures`（PROC-002），含可 `CALL` 的提示过程 |
-| `register_sync_constitution_procedure.sql` | 登记 `meta.sync_constitution()` 到 `business.procedures` 并写 `procedure_logs` |
-| `setup_llm_user.sql` | 初始化 LLM 助手数据库角色/权限（注释含 `\connect aierp`） |
-| `sync_constitution.sql` | 定义 `meta.sync_constitution()`：重建/同步 `meta_fields`、`meta_tables`（见文件内长注释） |
-| `add_workflow_intent_embeddings.sql` | 为 `business.workflows` 增加 `example_queries` / `query_embeddings`（`ADD COLUMN IF NOT EXISTS`） |
-| `update_meta_catalog_grid_20250325.sql` | 设计记忆入库 + 更新 `meta_tables`/`meta_fields`（与 TableView/导出等联动说明） |
+```bash
+psql -U nicjiang -d aierp -f constitution/create_meta_prompts.sql
+```
 
-### `engine/`
-
-| 路径 | 作用 |
-|------|------|
-| `__init__.py` | 包说明字符串：工作流执行引擎 |
-| `workflow.py` | 从 `business.workflow_steps` 读步骤并执行（`query_sql`/`code`/`llm`） |
-| `workflow_runner.py` | 将 workflow 结果转为聊天响应；含 `run_query_master_data`、`execute_workflow_for_chat` 等 |
-| `intent.py` | 从 `business.workflows` 做意图识别、`extract_query_params`、`explain_capabilities`（与 `llm/intent.py` 不同文件） |
-
-### `llm/`
-
-| 路径 | 作用 |
-|------|------|
-| `__init__.py` | 包说明字符串 |
-| `client.py` | OpenAI 兼容 LLM：`chat`、`chat_stream`、`chat_expert_only`、`chat_with_fallback`、`parse_file` 等；加载项目根 `.env` |
-| `tools.py` | `query_db`/`execute_db` 工具循环、挂起确认、`chat_with_db_outcome` 与流式变体 |
-| `intent.py` | 占位：`identify_intent`、`check_fields`、`ask_user`、`parse_reply` 空实现 |
-
-### `tools/`
-
-| 路径 | 作用 |
-|------|------|
-| `__init__.py` | 导出 `TOOLS` 字典与工作流可调函数 |
-| `database.py` | **实际使用的**双连接池（`ThreadedConnectionPool`）、`db_conn`/`db_conn_llm`、`query_table`/`write_table`/`update_table`、元数据读取 |
-| `file_reader.py` | `read_pdf`/`read_excel`/`read_image` 占位（返回 context 拷贝） |
-| `file_writer.py` | `export_excel`/`generate_pdf` 占位 |
-
-### `scripts/`
-
-| 路径 | 作用 |
-|------|------|
-| `fill_meta_fields_menu_labels.py` | 为 `meta.meta_fields` 填充菜单标签相关逻辑 |
-| `seed_create_contract_workflow.py` | 向库中种子化 create_contract 工作流 |
-| `sync_meta_cn.py` | 批量调 LLM 填 `field_cn` 等（与 `sync_constitution.sql` 注释呼应） |
-| `test_query_master_data.py` | 测试 `run_query_master_data` |
-| `test_workflow.py` | 测试 `run_workflow`（含库内步骤备份/恢复辅助函数） |
-| `test_intent_and_workflow.py` | 脚本级调用 `detect_intent` 与 `execute_workflow_for_chat`（无 `def main`） |
-| `sync_intent_embeddings.py` | 执行 `add_workflow_intent_embeddings.sql` 与 `seed_workflow_example_queries.sql` 后，将 `example_queries` 逐句向量化写入 `query_embeddings`（Ollama，`OLLAMA_EMBED_MODEL`） |
-| `seed_workflow_example_queries.sql` | 为部分 `intent` 写入/更新 `example_queries` 示例句（由 `sync_intent_embeddings.py` 调用） |
-| `upsert_design_memory.py` | 设计记忆 upsert 命令行入口 |
-
-### `frontend/`
-
-| 路径 | 作用 |
-|------|------|
-| `package.json` | Vue3 + Vite + vue-router + pinia + naive-ui + sortablejs |
-| `vite.config.js` | Vite：`@vitejs/plugin-vue`、`vite-plugin-vue-devtools`、`@` → `./src` |
-| `index.html` | 入口：`<script type="module" src="/src/main.js">` |
-| `src/main.js` | `createApp`、Pinia、Router、挂载 `#app` |
-| `src/App.vue` | 布局：`NavPanel` + `<RouterView />` + `AiPanel` |
-| `src/router/index.js` | 路由：`/dashboard`、`/meta`、`/meta/:table`、`/business`、`/business/:table`、`/ai-rules` |
-| `src/stores/app.js` | Pinia store：请求 `http://localhost:8000` 的 tables/nav/columns/CRUD/导出 |
-| `src/assets/main.css` | 全局样式（由 `main.js` 引入） |
-| `src/components/NavPanel.vue` | 侧栏导航、探测后端 `/`、拉取 tables/nav |
-| `src/components/DataNavPanel.vue` | 数据区导航（被 NavPanel 使用） |
-| `src/components/AiPanel.vue` | AI 对话面板（调用 `/ai/chat` 等，细节见组件内代码） |
-| `src/views/DashboardView.vue` | 仪表盘：展示 meta/business 表链接 |
-| `src/views/MetaView.vue` | 元数据分区视图 |
-| `src/views/BusinessView.vue` | 业务数据分区视图 |
-| `src/views/TableView.vue` | 通用表数据视图 |
-| `src/views/AiRulesView.vue` | AI 规则视图 |
-| `src/utils/tableExport.js` | `buildExportXlsxUrl`：拼后端 `GET /export/xlsx/...` |
-| `main.css` | 根目录样式文件（与 `src/assets/main.css` 并存） |
-| `main.js` | 根目录 JS（与 `src/main.js` 不同路径） |
-| `main.py` | **另一套** FastAPI：`psycopg2.connect` 直连、Anthropic API 的 `/ai/chat`（与根目录 `main.py` 不是同一应用） |
-| `App.vue`、`AiPanel.vue`、`DashboardView.vue`、`NavPanel.vue`、`TableView.vue`、`BusinessView.vue`、`MetaView.vue`、`AiRulesView.vue`（根目录） | 与 `src/` 下同名文件并存；**当前 Vite 入口未引用这些根目录 .vue**（以 `index.html` 为准） |
-| `app.js` / `index.js` | 根目录 JS 文件（非 Vite 当前入口） |
-| `dist/` | `vite build` 构建输出（html/js/css） |
-| `public/favicon.ico` | 静态资源 |
-| `README.md` | 前端子项目自述（若存在） |
-| `jsconfig.json` | JS 工程配置 |
-| `.vscode/extensions.json`、`.vscode/settings.json` | VS Code 工作区配置 |
-| `.gitignore` | 前端子目录忽略规则 |
-
-### 生成物 / 杂项
-
-- 各处 `__pycache__/*.pyc`：Python 字节码缓存。
-- `.DS_Store`：macOS 文件夹元数据。
+**改表或种子后**：再跑一次 `CALL meta.sync_constitution();`（若需把新表同步进 `meta_*` 目录）。
 
 ---
 
-## 2. 各文件中的函数 / 类（一句话）
+## 容易混的表（心智模型）
 
-### `main.py`
+- **`meta.prompts`**：所有注入 LLM 的提示词模块；字段 **`agent_role`** 区分归属。`inject_mode`：`always` = 拼装进 `build_prompt(agent_role)`，`on_demand` = 仅 `build_prompt_on_demand(prompt_code)`（如记忆清洗/压缩脚本）。
+- **`business.ai_memory`**：用户级 AI 记忆（`scope`：`session` / `longterm`），`source_session_id` 可选指向 **`business.ai_sessions`**。
+- **`business.ai_sessions` / `business.ai_chat`**：对话会话与消息原文；持久化由 `/ai/chat` 在提供 `user_id` 时写入。
 
-- `_env_bool`：从环境变量解析布尔。
-- `_cors_allow_origins_and_credentials`：计算 CORS 白名单与是否允许 credentials。
-- `_app_lifespan`：应用生命周期结束时 `close_all_pools()`。
-- `_prepare_user_text_for_intent_regex`：NFKC + 遮蔽否定删除子串供意图检测。
-- `_assert_tool_was_called`：用户话像数据库操作时若模型未调工具则抛错。
-- `assert_ident`：校验标识符正则，不合法则 HTTP 400。
-- `fetch_column_meta`：读 `information_schema.columns`。
-- `writable_columns` / `writable_names`：过滤可写列（排除向量、生成列等）。
-- `coerce_cell`：请求体值转为可写入 psycopg2 的类型。
-- `table_has_id`：元数据中是否存在 `id` 列。
-- `filterable_column_names`：可做模糊筛选的列名。
-- `_like_escape`：LIKE 转义。
-- `parse_filters_query`：解析查询参数 `filters` JSON。
-- `build_fuzzy_where_clause`：拼 ILIKE WHERE 片段与参数。
-- `_order_expr_for_column`：排序表达式（向量列转 text）。
-- `build_order_clause`：生成 `ORDER BY` 子句。
-- `normalize_sort_order_param`：规范化 asc/desc。
-- `fetch_table_page`：分页查表（可选 total）。
-- `root`：健康检查 JSON。
-- `list_tables`：列出 meta/business/ai_assistant 基表。
-- `_schema_by_table_name`：表名到 schema 映射。
-- `list_nav_tables`：按 `meta.meta_tables.nav_section` 分组导航。
-- `get_table_column_labels`：读 `meta.meta_fields` 列展示名。
-- `get_table`：分页+排序+筛选查表。
-- `_export_cell_value` / `_resolve_export_columns`：xlsx 导出单元格与列选择。
-- `export_table_xlsx`：返回 xlsx 二进制响应。
-- `table_insert` / `table_update` / `table_delete`：通用 CRUD。
-- `_sse_delta_payload`：SSE 增量帧字节。
-- `ChatMessage` / `ChatRequest`：Pydantic 请求体。
-- `get_llm_db_config`：返回 LLM 工具用的 PG 连接信息字典（环境变量默认值见代码）。
-- `_db_chat_system_prompt` / `_db_chat_after_operation_user_confirm_prompt`：拼接系统提示。
-- `ai_chat`：`POST /ai/chat` 处理（workflow 分支、DB 工具链、SSE）。
+**`agent_role` 与典型 prompt 条目（V5 之后）**
 
-### `tools/database.py`
+| `prompt_code` | `agent_role` | 说明 |
+|---------------|----------------|------|
+| `role_rules` | assistant | 人格与行为规则 |
+| `tool_query_interface` | assistant | **V5 重写**：意图级菜单，约定 **`[TOOL]`**（自然语言意图，**不含**表名/字段名） |
+| `tool_write_interface` | assistant | **V5 重写**：同上 |
+| `schema_shadow` | tool_expert | 领域表结构 JSON（`include_in_domain_model` 裁剪） |
+| **`tool_expert_executor`** | **tool_expert** | **V5 新增**：教 expert 输出 **`type: query|write`** 的 JSON + 多步闭环 + **`done`**；与 **`sql_engine`** 执行链路一致 |
+| `tool_query` | tool_expert | **V5 停用**（`is_active=false`）：旧版结构化 query 说明，由 SQL 路径取代 |
+| `tool_write` | tool_expert | **V5 停用**（`is_active=false`）：旧版结构化 write 说明，由 SQL 路径取代 |
+| `memory_session_clean` | memory_manager | 会话清洗（on_demand） |
+| `memory_longterm_compress` | memory_manager | 长期压缩（on_demand） |
 
-- `_api_pg_kwargs` / `_llm_pg_kwargs`：两套 psycopg2 连接参数。
-- `get_conn` / `release_conn` / `get_conn_llm` / `release_conn_llm`：从池取还连接。
-- `db_conn` / `db_conn_llm`：上下文管理器包装取还连接。
-- `close_all_pools`：关闭两个池。
-- `get_meta_tables` / `get_meta_fields`：读 meta 目录。
-- `_single_sql`：拒绝多语句。
-- `query_table` / `write_table` / `update_table`：工作流用 context SQL 执行封装。
-
-### `db_pool.py`（遗留副本）
-
-- 与 `tools/database.py` 同构的池与 `db_conn`/`db_conn_llm`/`close_all_pools`（见文件内注释）。
-
-### `engine/workflow.py`
-
-- `WorkflowStepError`：步骤失败异常（带步骤元数据）。
-- `_single_sql`、`_substitute_template`、`_run_query_sql`、`_run_code_step`、`_run_llm_step`、`_fetch_steps`、`_ensure_workflow_exists`、`_normalize_on_fail`：步骤执行内部逻辑。
-- `run_workflow`：按 intent 执行 workflow 步骤并写回 context。
-
-### `engine/workflow_runner.py`
-
-- `_validate_ident`、`_like_escape`、`_normalize_conditions_for_run`、`_stem_table`、`_discover_sub_tables`、`_parent_fk_column`：查询辅助。
-- `_summarize_query_narrative`：LLM 润色查询结果叙述。
-- `_persist_workflow_task`：写 `workflow_tasks` / `workflow_task_params`。
-- `run_query_master_data`：主数据查询工作流函数。
-- `_collect_execution_facts`、`_infer_status_hint`、`_llm_summarize_workflow_result`、`_fallback_plain_summary`、`_normalize_workflow_data_payload`：总结与包装。
-- `execute_workflow_for_chat`：对外统一返回字典给 HTTP。
-
-### `engine/intent.py`
-
-- `_parse_llm_json_object`：剥 markdown 围栏后 `json.loads`。
-- `_normalize_conditions_from_llm`：规范化 conditions 列表。
-- `extract_query_params`：LLM 抽取表名与查询条件。
-- `_load_workflows`：读 `business.workflows`（含 `example_queries`、`query_embeddings`）。
-- `_parse_example_queries_field` / `_parse_query_embeddings_field`：解析 JSON 字段。
-- `_layer1_substring_match`：第一层，示例句与用户话双向子串匹配。
-- `_get_embedding`：Ollama `embed`/`embeddings`，模型 `OLLAMA_EMBED_MODEL`（默认 `shaw/dmeta-embedding-zh`）。
-- `_layer2_embedding_scores`：与各 intent 示例向量比余弦，排序。
-- `_resolve_intent_fuzzy`：第三层 LLM 输出与库中 intent 的保守对齐（别名、前缀等）。
-- `_detect_intent_llm`：第三层，仅候选 workflow 上调 `chat`/`chat_expert_only`，返回前剥离 `intent=` 等前缀。
-- `detect_intent`：三层总入口（见下文「意图识别」）。
-- `explain_capabilities`：无匹配时的引导回复。
-
-### `llm/client.py`
-
-- `_load_dotenv_if_available`、`_env_str`、`_env_llm_api_key`：环境与配置。
-- `llm_openai_extra_body`：可选 `reasoning_effort`。
-- `_connection_hint`：连接错误提示文案。
-- `chat` / `chat_stream` / `chat_expert_only` / `chat_with_fallback` / `chat_stream_with_fallback`：LLM 调用。
-- `parse_file`：解析 `filename|base64` 上传（图片/Excel/PDF）。
-
-### `llm/tools.py`
-
-- 大量以下划线开头的校验/调度/流式合并函数（SQL 校验、DELETE/DROP 目标解析、挂起字典、OpenAI tool 循环等）。
-- `DbStreamPendingMarker`：流式 pending 标记 dataclass。
-- `chat_with_db_outcome_stream` / `resume_pending_db_chat_stream`：流式 DB 对话。
-- `chat_with_db` / `DbChatOutcome` / `chat_with_db_outcome` / `resume_pending_db_chat`：同步语义与 pending 恢复。
-
-### `llm/intent.py`
-
-- `identify_intent` / `check_fields` / `ask_user` / `parse_reply`：占位返回空或原 context。
-
-### `tools/__init__.py`
-
-- `query_master_data`：惰性导入 `run_query_master_data`。
-- `TOOLS`：名称到可调用工具的字典。
-
-### `tools/file_reader.py` / `file_writer.py`
-
-- `read_pdf` / `read_excel` / `read_image` / `export_excel` / `generate_pdf`：占位返回 context。
-
-### `llm_client.py` / `llm_tools.py`（遗留）
-
-- 与 `llm/client.py`、`llm/tools.py` 对应内容的老路径版本（`llm_tools` 仍 `from db_pool import db_conn_llm`）。
-
-### `frontend/src/stores/app.js`
-
-- `useAppStore`：Pinia store，内含 `fetchTables`、`fetchNavTables`、`fetchColumnLabels`、`fetchTableData`、`tableInsert`、`tableUpdate`、`tableDelete`、`downloadTableXlsx`、`_errDetail` 等。
-
-### `frontend/src/utils/tableExport.js`
-
-- `buildExportXlsxUrl`：构造导出 URL。
-
-### `frontend/main.py`
-
-- `_cors`：CORS 配置元组。
-- `get_conn`：`psycopg2.connect` 固定参数。
-- `root` / `list_tables` / `get_table`：简化只读 API。
-- `ChatMessage` / `ChatRequest`：聊天请求模型。
-- `ai_chat`：转发 Anthropic Messages API。
-
-### `scripts/`（主要入口与辅助）
-
-- `fill_meta_fields_menu_labels.py`：`has_cjk`、`first_cjk_phrase`、`humanize_en`、`menu_cn`、`menu_en`、`main`。
-- `seed_create_contract_workflow.py`：`_conn_kwargs`、`main`。
-- `sync_meta_cn.py`：`_parse_json_array`、`_fetch_batch`、`_build_prompt`、`main`。
-- `test_workflow.py`：多个 `_` 前缀辅助函数与 `main`。
-- `test_query_master_data.py`：`_print_case_header`、`_print_result`、`_audit_workflow_tables`、`main`。
-- `upsert_design_memory.py`：`parse_args`、`main`。
-- `test_intent_and_workflow.py`：顶层脚本逻辑，无函数定义。
-- `sync_intent_embeddings.py`：执行 DDL/种子 SQL、批量 embedding 写库（顶层脚本）。
-
-### Vue 单文件组件（`script setup`，无导出类）
-
-- `src/App.vue`：壳布局。
-- `src/components/NavPanel.vue`：侧栏与 API 状态。
-- `src/components/DataNavPanel.vue`：数据导航树/列表（实现见文件）。
-- `src/components/AiPanel.vue`：聊天 UI 与请求。
-- `src/views/DashboardView.vue`：仪表盘统计与表链接。
-- `src/views/MetaView.vue`、`BusinessView.vue`、`TableView.vue`、`AiRulesView.vue`：各路由页面 UI（实现见文件）。
+> **`build_prompt('tool_expert')`** 只加载 **`is_active = TRUE`** 且 **`inject_mode = 'always'`** 的片段，因此停用的 **`tool_query` / `tool_write`** 不会进入 expert 的 system prompt；典型注入组合为 **`schema_shadow` + `tool_expert_executor`**。
 
 ---
 
-## 3. 数据库连接方式
+## 其他脚本（按需）
 
-- **HTTP API 主路径**（`main.py` 使用 `from tools.database import close_all_pools, db_conn`）：`psycopg2.pool.ThreadedConnectionPool`，封装在 `tools/database.py`。
-  - 连接参数来源环境变量：`PGDATABASE`（默认 `aierp`）、`PGUSER`（默认 `nicjiang`）、`PGHOST`（默认 `localhost`）、`PGPORT`（默认 `5432`）；**未在 `_api_pg_kwargs` 中设置 password**（由 libpq 默认机制处理）。
-  - 池大小：`PG_POOL_MAX`（默认 20），最小连接数 1。
-- **LLM 工具 / 工作流**（`db_conn_llm()`）：**第二个** `ThreadedConnectionPool`，默认用户 `llm_assistant`、默认密码 `llm_safe_2024`（环境变量 `PGUSER`/`PGPASSWORD` 可覆盖，与 `main.get_llm_db_config()` 注释一致）。
-  - 池大小：`PG_POOL_MAX_LLM`（默认同 `PG_POOL_MAX`）。
-- `main.py` 中 `get_llm_db_config()` 返回给 `chat_with_db_outcome` 等的字典**不用于** `llm/tools.py` 里实际建连；`llm/tools.py` 注释写明执行使用 `db_conn_llm()`。
-- 遗留文件 `db_pool.py` 实现与 `tools/database.py` 同型双池；根目录 `frontend/main.py` 使用 **`psycopg2.connect` 单次连接**（硬编码 `dbname/user/host/port`），与主后端不同。
-
----
-
-## 4. 意图识别（`detect_intent`，与 `engine/intent.py` 实现一致）
-
-- **第一层**：`_layer1_substring_match`，对 `business.workflows.example_queries` 中每条示例句与用户输入做双向子串（`ex in user` 或 `user in ex`），命中则直接返回对应 `intent`。
-- **第二层**：用户话量化为向量（`ollama` 包，`OLLAMA_EMBED_MODEL`，默认 `shaw/dmeta-embedding-zh`）；与各 intent 的 `query_embeddings` 比余弦相似度，常量 `_EMBED_HIGH=0.85`、`_EMBED_LOW=0.60`。
-  - 若**无法**得到用户向量：打日志后**跳过**第二层，第三层对**全部** workflow 调 LLM。
-  - 若最高相似度 **`>0.85`** 且在容差内**唯一** intent：直接返回该 intent。
-  - 若最高相似度 **`>0.85`** 但**多个** intent 并列：第三层仅在这些并列 intent 上调 LLM。
-  - 若最高相似度 **`<0.60`**：不匹配，返回 `None`（不调第三层）。
-  - 若最高相似度在 **`[0.60, 0.85]`**：第三层携带所有相似度 `≥0.60` 的 intent 作为候选调 LLM。
-- **第三层**：`_detect_intent_llm`，仅在候选 workflow 列表上请求 LLM 返回 intent 或 `null`；`use_expert=True` 时走 `chat_expert_only`。返回串会先去掉引号及 `intent=` / `意图：` 等前缀，再与库名精确匹配，必要时 `_resolve_intent_fuzzy`。
-
-**新增 intent（数据与向量）**
-
-1. 在 `business.workflows` 插入或更新行，填写 `example_queries`（约 15 条）。
-2. 运行 `python scripts/sync_intent_embeddings.py`（会执行 `constitution/add_workflow_intent_embeddings.sql`、种子 SQL，并写回 `query_embeddings`）。
-3. 无需改 Python 业务代码即可生效。
-
-**环境**：`OLLAMA_EMBED_MODEL`（默认 `shaw/dmeta-embedding-zh`，可与 `.env` 一致）；需本机 Ollama 已拉取对应模型。
-
----
-
-## 5. 前端框架与主要页面
-
-- **框架**：Vue 3 + **Vite 7** + **vue-router 5** + **Pinia 3** + **naive-ui** + **sortablejs**（见 `frontend/package.json`）。
-- **路由与页面**（`src/router/index.js`）：
-  - `/` → 重定向 `/dashboard`
-  - `/dashboard` → `DashboardView.vue`（标题 meta：仪表盘）
-  - `/meta` → `MetaView.vue`（元数据）
-  - `/meta/:table` → `TableView.vue`
-  - `/business` → `BusinessView.vue`（业务数据）
-  - `/business/:table` → `TableView.vue`
-  - `/ai-rules` → `AiRulesView.vue`（AI 规则）
-- **全局布局**：`App.vue` 中左侧 `NavPanel`、中间 `RouterView`、右侧 `AiPanel`。
-- **API 基址**：`src/stores/app.js` 与 `src/utils/tableExport.js` 中写死 `http://localhost:8000`（与 `dev.sh` 后端端口一致）。
-
----
-
-## 6. 启动方式（代码/脚本中实际出现的命令）
-
-- **一键**：仓库根目录 `./dev.sh`  
-  - 使用 `.venv/bin/python`（若不存在则打印提示并退出）。  
-  - 执行：`.venv/bin/python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000`  
-  - 子 shell：`cd frontend && npm run dev`  
-  - `wait` 等待子进程；`INT/TERM` 时 `kill` 后台任务。
-- **仅后端**（`常用命令.txt` 与 `dev.sh` 一致）：在项目根目录  
-  `.venv/bin/python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000`  
-  （注释要求工作目录为仓库根，以便加载本仓库 `main.py`。）
-- **仅前端**：`cd frontend && npm run dev`（Vite 开发服务器；具体端口以终端输出为准，CORS 白名单含 5173）。
-- **Python 依赖**：`pip install -r requirements.txt`（`dev.sh` 提示用 `python3 -m venv .venv` 创建环境）。
-
----
-
-## 附：根目录 `main.py` 提供的 HTTP 路径（便于对照）
-
-- `GET /`、`GET /tables`、`GET /nav/tables`、`GET /table-columns/{table_name}`
-- `GET /table/{schema}/{table_name}`、`GET /export/xlsx/{schema}/{table_name}`
-- `POST/PATCH/DELETE /table/...`（插入/更新/删除）
-- `POST /ai/chat`
-
-（`frontend/main.py` 为独立应用，不在 `dev.sh` 中启动。）
+- `scripts/sync_schema_shadow.py`：单独生成 schema 影子 JSON 到 `meta.prompts`
+- `scripts/sync_meta_cn.py`：单独补字段中文名

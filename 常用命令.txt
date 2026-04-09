@@ -1,6 +1,7 @@
 常用命令
-进入数据库：psql -U nicjiang -d aierp
-需要终端在aierp目录里
+
+
+
 
 ────────────────────────────────────────
 同步宪法 + 本地 LLM 填 meta 字段中文名（一次执行）
@@ -33,18 +34,27 @@
 
 命令行是：bash dev.sh
 
+执行sql语句的命令方式，里面的文件是cursor写的，只执行：psql -U nicjiang -d aierp -f constitution/v5_2_sql_engine_tool_expert.sql
+
 
 激活虚拟环境
 source .venv/bin/activate
 
-执行setup_llm_user.sql语句实例：psql -U nicjiang -d postgres -f /Users/nicjiang/aierp/setup_llm_user.sql
-
+进入数据库：psql -U nicjiang -d aierp
+需要终端在aierp目录里
 
 查询一个表的格式举例：SELECT column_name, data_type
 FROM information_schema.columns
 WHERE table_schema = 'business'
 AND table_name = 'workflow_steps'
 ORDER BY ordinal_position;
+
+
+
+执行setup_llm_user.sql语句实例：psql -U nicjiang -d postgres -f /Users/nicjiang/aierp/setup_llm_user.sql
+
+
+
 
 
 端口占用处理：

@@ -4,6 +4,7 @@
 -- 用法：CALL meta.sync_constitution();
 --       然后（为 field_cn 填中文名）: python scripts/sync_meta_cn.py
 -- 作用：先清空并重建 meta_fields（业务表字段），再同步 meta_tables；
+--       新增 meta_tables 行时写入 include_in_domain_model（business=true，meta=false），已有行不覆盖该开关；
 --       字段注释来自 pg_description（COMMENT ON COLUMN）
 --       field_cn 由库内留空，需单独运行 sync_meta_cn.py 批量调 LLM 生成
 --
@@ -139,13 +140,17 @@ BEGIN
         ) INTO v_exists;
 
         IF NOT v_exists THEN
-            INSERT INTO meta.meta_tables (table_name, table_cn, description, keywords, confirm_before_write)
+            INSERT INTO meta.meta_tables (
+                table_name, table_cn, description, keywords, confirm_before_write,
+                include_in_domain_model
+            )
             VALUES (
                 v_table.table_name,
                 v_table.table_name,
                 COALESCE(v_table.table_comment, ''),
                 '',
-                true
+                true,
+                (v_table.table_schema = 'business')
             );
             v_tables_insert := v_tables_insert + 1;
             RAISE NOTICE '新增表：%', v_table.table_name;

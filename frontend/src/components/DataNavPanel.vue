@@ -25,6 +25,7 @@ import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { NCollapse, NCollapseItem } from 'naive-ui'
 import { useAppStore } from '../stores/app'
+import { navItemInSplitGroup } from '../config/tableSplit'
 
 const store = useAppStore()
 const route = useRoute()
@@ -38,7 +39,12 @@ const blocks = computed(() => [
 
 function isActive(item) {
   const p = route.path
-  return p === `/${item.schema}/${item.table_name}`
+  if (p === `/${item.schema}/${item.table_name}`) return true
+  const curTable = route.params?.table
+  if (curTable && navItemInSplitGroup(String(curTable), item.table_name)) {
+    return true
+  }
+  return false
 }
 
 onMounted(async () => {

@@ -6,6 +6,8 @@
   .venv/bin/python scripts/sync_meta_cn.py
 
 前置：已执行 CALL meta.sync_constitution();
+
+一键三步（constitution → 本脚本 → schema_shadow）：见 scripts/sync_meta_pipeline.py
 """
 
 from __future__ import annotations

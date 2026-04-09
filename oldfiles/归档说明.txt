@@ -1,0 +1,7 @@
+本目录为推翻重建前的完整归档。
+
+包含：engine、main.py（旧）、scripts、constitution、docs、旧版根目录 llm_*.py / db_pool.py、
+tools 全目录（含 file_reader / file_writer 与旧 __init__）、llm/tools.py（依赖旧 tools 与业务逻辑）。
+
+仓库根目录保留：.env、requirements.txt、dev.sh、.gitignore、README.md、frontend/、llm/client.py 与 llm/intent.py、
+精简后的 tools/（仅 database.py 与新的 __init__.py，供数据库连接与 llm.client 使用）。

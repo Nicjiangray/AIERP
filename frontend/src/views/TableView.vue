@@ -4,7 +4,7 @@
       <div class="breadcrumb">
         <router-link :to="`/${schema}`" class="crumb">{{ schema }}</router-link>
         <span class="sep mono">/</span>
-        <span class="crumb active">{{ tableTitle }}</span>
+        <span class="crumb active">{{ splitCfg ? splitHeadline : tableTitle }}</span>
       </div>
       <div
         class="header-actions"
@@ -23,7 +23,7 @@
           导出 Excel
         </n-button>
         <n-button
-          v-if="hasIdColumn"
+          v-if="hasIdColumn && !splitCfg"
           size="small"
           tertiary
           :disabled="!hasIdColumn"
@@ -31,6 +31,25 @@
         >
           新增
         </n-button>
+        <template v-if="splitCfg">
+          <n-button
+            v-if="hasIdColumn"
+            size="small"
+            tertiary
+            @click="openAdd"
+          >
+            新增（主表）
+          </n-button>
+          <n-button
+            v-if="childHasIdColumn"
+            size="small"
+            tertiary
+            :disabled="selectedParentKey == null"
+            @click="openAddChild"
+          >
+            新增（子表）
+          </n-button>
+        </template>
         <n-button
           size="small"
           tertiary
@@ -57,37 +76,123 @@
 
     <div
       v-else-if="rows.length > 0 || colDefs.length > 0"
+      :class="splitCfg ? 'split-root' : 'table-wrap'"
       ref="tableWrapRef"
-      class="table-wrap"
     >
-      <div class="filter-toolbar">
-        <n-input
-          :value="globalSearch"
+      <!-- 单表 -->
+      <template v-if="!splitCfg">
+        <div class="filter-toolbar">
+          <n-input
+            :value="globalSearch"
+            size="small"
+            clearable
+            placeholder="任意列模糊，回车搜索（与列头筛选 AND）"
+            class="filter-global"
+            @update:value="(v) => { globalSearch = v ?? '' }"
+            @keydown.enter="doSearch"
+          />
+          <n-button size="tiny" tertiary @click="clearFilters">清空筛选</n-button>
+        </div>
+        <n-data-table
+          remote
+          :columns="columns"
+          :data="rows"
+          :row-key="rowKeyFn"
+          :scroll-x="scrollXMin"
+          :max-height="'calc(100vh - 220px)'"
+          :bordered="false"
+          :single-line="false"
+          :pagination="pagination"
           size="small"
-          clearable
-          placeholder="任意列模糊，回车搜索（与列头筛选 AND）"
-          class="filter-global"
-          @update:value="(v) => { globalSearch = v ?? '' }"
-          @keydown.enter="doSearch"
+          striped
+          @update:page="onPageChange"
+          @update:page-size="onPageSizeChange"
+          @update:sorter="onUpdateSorter"
         />
-        <n-button size="tiny" tertiary @click="clearFilters">清空筛选</n-button>
-      </div>
-      <n-data-table
-        remote
-        :columns="columns"
-        :data="rows"
-        :row-key="rowKeyFn"
-        :scroll-x="scrollXMin"
-        :max-height="'calc(100vh - 220px)'"
-        :bordered="false"
-        :single-line="false"
-        :pagination="pagination"
-        size="small"
-        striped
-        @update:page="onPageChange"
-        @update:page-size="onPageSizeChange"
-        @update:sorter="onUpdateSorter"
-      />
+      </template>
+
+      <!-- 主从分屏 -->
+      <template v-else>
+        <div class="split-pane split-pane--parent">
+          <div class="split-pane-title text-3">
+            主表 · {{ tableTitle }}
+            <span class="mono split-hint">（点击行以筛选下方子表）</span>
+          </div>
+          <div class="filter-toolbar">
+            <n-input
+              :value="globalSearch"
+              size="small"
+              clearable
+              placeholder="主表：任意列模糊，回车搜索"
+              class="filter-global"
+              @update:value="(v) => { globalSearch = v ?? '' }"
+              @keydown.enter="doSearch"
+            />
+            <n-button size="tiny" tertiary @click="clearFilters">清空筛选</n-button>
+          </div>
+          <n-data-table
+            remote
+            :columns="columns"
+            :data="rows"
+            :row-key="rowKeyFn"
+            :row-props="parentRowProps"
+            :scroll-x="scrollXMin"
+            :max-height="'min(42vh, 360px)'"
+            :bordered="false"
+            :single-line="false"
+            :pagination="pagination"
+            size="small"
+            striped
+            @update:page="onPageChange"
+            @update:page-size="onPageSizeChange"
+            @update:sorter="onUpdateSorter"
+          />
+        </div>
+        <div class="split-divider" />
+        <div class="split-pane split-pane--child" ref="childTableWrapRef">
+          <div class="split-pane-title text-3">
+            子表 · {{ childTitle }}
+          </div>
+          <div v-if="selectedParentKey == null" class="split-child-placeholder text-3">
+            请在上表选择一行，子表将按关联字段筛选。
+          </div>
+          <template v-else>
+            <div class="filter-toolbar">
+              <n-input
+                :value="childGlobalSearch"
+                size="small"
+                clearable
+                placeholder="子表：任意列模糊，回车搜索（在已选主表范围内）"
+                class="filter-global"
+                @update:value="(v) => { childGlobalSearch = v ?? '' }"
+                @keydown.enter="doChildSearch"
+              />
+              <n-button size="tiny" tertiary @click="clearChildFilters">清空</n-button>
+            </div>
+            <div v-if="childLoading && !childRows.length && !childColDefs.length" class="loading-wrap child-loading">
+              <n-spin size="small" />
+              <span class="text-3">加载子表…</span>
+            </div>
+            <n-data-table
+              v-else
+              remote
+              :columns="childColumns"
+              :data="childRows"
+              :row-key="rowKeyFn"
+              :scroll-x="childScrollXMin"
+              :max-height="'min(38vh, 320px)'"
+              :bordered="false"
+              :single-line="false"
+              :pagination="childPagination"
+              size="small"
+              striped
+              @update:page="onChildPageChange"
+              @update:page-size="onChildPageSizeChange"
+              @update:sorter="onChildSorter"
+            />
+          </template>
+        </div>
+      </template>
     </div>
 
     <div v-else class="empty">
@@ -156,6 +261,7 @@ import {
 import { useRoute } from 'vue-router'
 import { useAppStore } from '../stores/app'
 import { buildExportXlsxUrl } from '../utils/tableExport'
+import { splitConfigForRouteTable } from '../config/tableSplit'
 import Sortable from 'sortablejs'
 import {
   NDataTable,
@@ -242,6 +348,18 @@ provide(FILTER_CLEAR_GEN_KEY, filterClearGeneration)
 const schema = computed(() => (route.path.startsWith('/meta') ? 'meta' : 'business'))
 const tableName = computed(() => route.params.table)
 
+/** 主从分屏：路由为父表或子表名均可 */
+const splitCfg = computed(() => splitConfigForRouteTable(String(tableName.value || '')))
+const displaySchema = computed(() => splitCfg.value?.parent.schema ?? schema.value)
+const displayTable = computed(() => splitCfg.value?.parent.table ?? tableName.value)
+const childSchema = computed(() => splitCfg.value?.child.schema ?? '')
+const childTable = computed(() => splitCfg.value?.child.table ?? '')
+const childFk = computed(() => splitCfg.value?.child.fk ?? '')
+const parentKeyCol = computed(() => splitCfg.value?.parent.key ?? 'id')
+
+const selectedParentKey = ref(null)
+const crudTarget = ref('parent')
+
 const rows = ref([])
 const colDefs = ref([])
 const loading = ref(false)
@@ -267,7 +385,22 @@ const pagination = reactive({
 })
 const editSnapshot = ref(null)
 const undoStack = ref([])
+const childRows = ref([])
+const childColDefs = ref([])
+const childLoading = ref(false)
+const childGlobalSearch = ref('')
+const childColumnFilters = reactive({})
+const childSortBy = ref('id')
+const childSortOrder = ref('desc')
+const childPagination = reactive({
+  page: 1,
+  pageSize: 200,
+  itemCount: 0,
+  showSizePicker: true,
+  pageSizes: [50, 100, 200, 500],
+})
 const tableWrapRef = ref(null)
+const childTableWrapRef = ref(null)
 /** 用户拖拽后的列顺序；null 表示跟随 meta_fields 默认顺序 */
 const manualOrder = ref(null)
 let headerSortable = null
@@ -275,10 +408,22 @@ let headerSortable = null
 const BLOCK_FORM = new Set(['embedding', 'password_hash', 'intent_embedding'])
 
 const tableTitle = computed(() => {
-  const n = tableName.value
+  const n = splitCfg.value ? displayTable.value : tableName.value
   const all = [...store.nav.design, ...store.nav.prep, ...store.nav.run]
   const hit = all.find((t) => t.table_name === n)
   return hit?.table_cn || n
+})
+
+const childTitle = computed(() => {
+  if (!splitCfg.value) return ''
+  const all = [...store.nav.design, ...store.nav.prep, ...store.nav.run]
+  const hit = all.find((t) => t.table_name === childTable.value)
+  return hit?.table_cn || childTable.value
+})
+
+const splitHeadline = computed(() => {
+  if (!splitCfg.value) return ''
+  return `${tableTitle.value} → ${childTitle.value}`
 })
 
 function unionRowKeys(rowsArr) {
@@ -313,11 +458,33 @@ const effectiveDataKeys = computed(() =>
   mergeColumnOrder(manualOrder.value, orderedFieldKeys.value)
 )
 
-const hasIdColumn = computed(() => orderedFieldKeys.value.includes('id'))
+const childOrderedFieldKeys = computed(() => {
+  const defs = childColDefs.value
+  const fromMeta = defs.map((d) => d.field_name)
+  const fromRows = unionRowKeys(childRows.value)
+  const extra = fromRows.filter((k) => !fromMeta.includes(k))
+  extra.sort()
+  if (fromMeta.length) return [...fromMeta, ...extra]
+  return fromRows.sort()
+})
 
-const formKeys = computed(() =>
-  effectiveDataKeys.value.filter((k) => !BLOCK_FORM.has(k))
-)
+const hasIdColumn = computed(() => orderedFieldKeys.value.includes('id'))
+const childHasIdColumn = computed(() => childOrderedFieldKeys.value.includes('id'))
+
+const formKeys = computed(() => {
+  let keys
+  if (showModal.value && crudTarget.value === 'child') {
+    const defs = childColDefs.value
+    const fromMeta = defs.map((d) => d.field_name)
+    const fromRows = unionRowKeys(childRows.value)
+    const extra = fromRows.filter((k) => !fromMeta.includes(k))
+    extra.sort()
+    keys = fromMeta.length ? [...fromMeta, ...extra] : fromRows.sort()
+  } else {
+    keys = effectiveDataKeys.value
+  }
+  return keys.filter((k) => !BLOCK_FORM.has(k))
+})
 
 const scrollXMin = computed(() => {
   const n = effectiveDataKeys.value.length
@@ -327,7 +494,7 @@ const scrollXMin = computed(() => {
 function loadStoredColumnOrder() {
   try {
     const raw = localStorage.getItem(
-      `aierp:colOrder:${schema.value}.${tableName.value}`
+      `aierp:colOrder:${displaySchema.value}.${displayTable.value}`
     )
     if (!raw) return null
     const arr = JSON.parse(raw)
@@ -376,19 +543,25 @@ function bindHeaderSortable() {
       next.splice(to, 0, moved)
       manualOrder.value = next
       localStorage.setItem(
-        `aierp:colOrder:${schema.value}.${tableName.value}`,
+        `aierp:colOrder:${displaySchema.value}.${displayTable.value}`,
         JSON.stringify(next)
       )
     },
   })
 }
 
-const modalTitle = computed(() =>
-  modalMode.value === 'add' ? `新增 · ${tableTitle.value}` : `编辑 · ${tableTitle.value}`
-)
+const modalTitle = computed(() => {
+  const tit =
+    crudTarget.value === 'child' ? childTitle.value : tableTitle.value
+  return modalMode.value === 'add' ? `新增 · ${tit}` : `编辑 · ${tit}`
+})
 
 function fieldMeta(key) {
-  return colDefs.value.find((c) => c.field_name === key)
+  const defs =
+    showModal.value && crudTarget.value === 'child'
+      ? childColDefs.value
+      : colDefs.value
+  return defs.find((c) => c.field_name === key)
 }
 
 function labelOf(key) {
@@ -406,6 +579,29 @@ function isJson(key) {
 
 function rowKeyFn(row) {
   return row?.id ?? JSON.stringify(row)
+}
+
+function parentRowProps(row) {
+  if (!splitCfg.value) return undefined
+  const k = row[parentKeyCol.value]
+  const sel =
+    selectedParentKey.value != null &&
+    String(k) === String(selectedParentKey.value)
+  return {
+    style: 'cursor: pointer;',
+    class: sel ? 'split-parent-row--selected' : '',
+    onClick: () => {
+      selectedParentKey.value = k == null ? null : k
+      childPagination.page = 1
+      loadChild()
+    },
+  }
+}
+
+function childLabelOf(key) {
+  return (
+    childColDefs.value.find((c) => c.field_name === key)?.menu_label_cn || key
+  )
 }
 
 function rowToForm(row) {
@@ -498,18 +694,48 @@ function pushUndo(entry) {
 
 function openAdd() {
   if (!hasIdColumn.value) return
+  crudTarget.value = 'parent'
   modalMode.value = 'add'
   editSnapshot.value = null
   formModel.value = emptyForm()
   showModal.value = true
 }
 
+async function openAddChild() {
+  if (!splitCfg.value || !childHasIdColumn.value) return
+  if (selectedParentKey.value == null) {
+    message.warning('请先在上表选择一行（主表记录）')
+    return
+  }
+  crudTarget.value = 'child'
+  modalMode.value = 'add'
+  editSnapshot.value = null
+  showModal.value = true
+  await nextTick()
+  formModel.value = emptyForm()
+  const fk = childFk.value
+  if (fk) {
+    formModel.value[fk] = String(selectedParentKey.value)
+  }
+}
+
 function openEdit(row) {
   if (!hasIdColumn.value || row.id == null) return
+  crudTarget.value = 'parent'
   modalMode.value = 'edit'
   editSnapshot.value = JSON.parse(JSON.stringify(row))
   formModel.value = rowToForm(row)
   showModal.value = true
+}
+
+async function openEditChild(row) {
+  if (!childHasIdColumn.value || row.id == null) return
+  crudTarget.value = 'child'
+  modalMode.value = 'edit'
+  editSnapshot.value = JSON.parse(JSON.stringify(row))
+  showModal.value = true
+  await nextTick()
+  formModel.value = rowToForm(row)
 }
 
 async function submitForm() {
@@ -520,20 +746,29 @@ async function submitForm() {
     message.error(e.message || String(e))
     return
   }
+  const sch =
+    crudTarget.value === 'child' ? childSchema.value : displaySchema.value
+  const tbl =
+    crudTarget.value === 'child' ? childTable.value : displayTable.value
   saving.value = true
   try {
     if (modalMode.value === 'add') {
-      const { row } = await store.tableInsert(schema.value, tableName.value, payload)
-      pushUndo({ type: 'insert', id: row.id })
+      const { row } = await store.tableInsert(sch, tbl, payload)
+      if (crudTarget.value === 'parent') {
+        pushUndo({ type: 'insert', id: row.id })
+      }
       message.success('已新增')
     } else {
       const id = editSnapshot.value?.id
-      const { row } = await store.tableUpdate(schema.value, tableName.value, id, payload)
-      pushUndo({ type: 'update', id, before: editSnapshot.value })
+      const { row } = await store.tableUpdate(sch, tbl, id, payload)
+      if (crudTarget.value === 'parent') {
+        pushUndo({ type: 'update', id, before: editSnapshot.value })
+      }
       message.success('已保存')
     }
     showModal.value = false
     await load()
+    if (splitCfg.value) await loadChild()
   } catch (e) {
     message.error(e.message || String(e))
   } finally {
@@ -550,10 +785,30 @@ function onDeleteRow(row) {
     negativeText: '取消',
     onPositiveClick: async () => {
       try {
-        await store.tableDelete(schema.value, tableName.value, row.id)
+        await store.tableDelete(displaySchema.value, displayTable.value, row.id)
         pushUndo({ type: 'delete', row: JSON.parse(JSON.stringify(row)) })
         message.success('已删除')
         await load()
+        if (splitCfg.value) await loadChild()
+      } catch (e) {
+        message.error(e.message || String(e))
+      }
+    },
+  })
+}
+
+function onDeleteChildRow(row) {
+  if (row.id == null) return
+  dialog.warning({
+    title: '确认删除',
+    content: `确定删除子表 id = ${row.id} ？`,
+    positiveText: '删除',
+    negativeText: '取消',
+    onPositiveClick: async () => {
+      try {
+        await store.tableDelete(childSchema.value, childTable.value, row.id)
+        message.success('已删除')
+        await loadChild()
       } catch (e) {
         message.error(e.message || String(e))
       }
@@ -566,18 +821,24 @@ async function doUndo() {
   if (!e) return
   try {
     if (e.type === 'insert') {
-      await store.tableDelete(schema.value, tableName.value, e.id)
+      await store.tableDelete(displaySchema.value, displayTable.value, e.id)
       message.success('已撤销新增')
     } else if (e.type === 'delete') {
-      await store.tableInsert(schema.value, tableName.value, e.row)
+      await store.tableInsert(displaySchema.value, displayTable.value, e.row)
       message.success('已撤销删除')
     } else if (e.type === 'update') {
       const payload = { ...e.before }
       delete payload.id
-      await store.tableUpdate(schema.value, tableName.value, e.id, payload)
+      await store.tableUpdate(
+        displaySchema.value,
+        displayTable.value,
+        e.id,
+        payload
+      )
       message.success('已撤销修改')
     }
     await load()
+    if (splitCfg.value) await loadChild()
   } catch (err) {
     message.error(err.message || String(err))
     undoStack.value.push(e)
@@ -684,6 +945,81 @@ const columns = computed(() => {
   return [actionCol, ...dataCols]
 })
 
+function buildChildDataColumn(key) {
+  return {
+    title: () =>
+      h('div', { class: 'th-stack' }, [
+        h('div', { class: 'th-label' }, [
+          h('span', { class: 'th-text' }, childLabelOf(key)),
+        ]),
+      ]),
+    key,
+    sorter: true,
+    ellipsis: { tooltip: true },
+    minWidth: 112,
+    width: 140,
+    render(row) {
+      const val = row[key]
+      if (val === null || val === undefined) {
+        return h(
+          'span',
+          { style: 'color: rgba(0,0,0,0.45); font-style: italic;' },
+          'null'
+        )
+      }
+      const str = typeof val === 'object' ? JSON.stringify(val) : String(val)
+      return h('span', { class: 'cell-val' }, str)
+    },
+  }
+}
+
+const _childColKeysSnapshot = computed(() => childOrderedFieldKeys.value.join('|'))
+
+const childColumns = computed(() => {
+  const keysStr = _childColKeysSnapshot.value
+  const keys = keysStr ? keysStr.split('|') : []
+  const dataCols = keys.map((key) => buildChildDataColumn(key))
+  if (!childHasIdColumn.value) return dataCols
+  const actionCol = {
+    title: () =>
+      h('div', { class: 'th-stack' }, [
+        h('div', { class: 'th-label th-label--action' }, '操作'),
+      ]),
+    key: '_child_actions',
+    width: 120,
+    fixed: 'left',
+    render(row) {
+      return h('div', { class: 'act-cell' }, [
+        h(
+          NButton,
+          {
+            size: 'tiny',
+            tertiary: true,
+            onClick: () => openEditChild(row),
+          },
+          () => '编辑'
+        ),
+        h(
+          NButton,
+          {
+            size: 'tiny',
+            tertiary: true,
+            type: 'error',
+            onClick: () => onDeleteChildRow(row),
+          },
+          () => '删除'
+        ),
+      ])
+    },
+  }
+  return [actionCol, ...dataCols]
+})
+
+const childScrollXMin = computed(() => {
+  const n = childOrderedFieldKeys.value.length
+  return Math.max(640, n * 120 + (childHasIdColumn.value ? 120 : 0))
+})
+
 const EXPORT_ROW_CAP = 10000
 
 function buildFilterPayload() {
@@ -740,8 +1076,8 @@ function doExport() {
   exporting.value = true
   try {
     const url = buildExportXlsxUrl(
-      schema.value,
-      tableName.value,
+      displaySchema.value,
+      displayTable.value,
       EXPORT_ROW_CAP,
       effectiveDataKeys.value,
       {
@@ -766,19 +1102,72 @@ function doExport() {
   }
 }
 
+async function loadChild() {
+  if (!splitCfg.value) return
+  if (selectedParentKey.value == null) {
+    childRows.value = []
+    childColDefs.value = []
+    childPagination.itemCount = 0
+    childLoading.value = false
+    return
+  }
+  childLoading.value = true
+  try {
+    const lim = childPagination.pageSize
+    const off = (childPagination.page - 1) * lim
+    const fk = childFk.value
+    const filters = { [fk]: String(selectedParentKey.value) }
+    const qq = childGlobalSearch.value.trim()
+    const [data, labels] = await Promise.all([
+      store.fetchTableData(childSchema.value, childTable.value, lim, {
+        filters,
+        offset: off,
+        sortBy: childSortBy.value || undefined,
+        sortOrder: childSortOrder.value || undefined,
+        q: qq || undefined,
+      }),
+      store.fetchColumnLabels(childTable.value),
+    ])
+    childRows.value = data.rows || []
+    childColDefs.value = labels.columns || []
+    childPagination.itemCount =
+      typeof data.total === 'number' ? data.total : childRows.value.length
+    const maxPage = Math.max(
+      1,
+      Math.ceil(childPagination.itemCount / childPagination.pageSize) || 1
+    )
+    if (childPagination.page > maxPage) {
+      childPagination.page = maxPage
+      return loadChild()
+    }
+    await nextTick()
+    if (
+      childSortBy.value != null &&
+      !childOrderedFieldKeys.value.includes(childSortBy.value)
+    ) {
+      childSortBy.value = childOrderedFieldKeys.value.includes('id')
+        ? 'id'
+        : childOrderedFieldKeys.value[0] || null
+      childSortOrder.value = childSortBy.value === 'id' ? 'desc' : 'asc'
+    }
+  } finally {
+    childLoading.value = false
+  }
+}
+
 async function load() {
   loading.value = true
   rows.value = []
   const lim = pagination.pageSize
   const off = (pagination.page - 1) * lim
   const [data, labels] = await Promise.all([
-    store.fetchTableData(schema.value, tableName.value, lim, {
+    store.fetchTableData(displaySchema.value, displayTable.value, lim, {
       ...buildFilterPayload(),
       offset: off,
       sortBy: sortBy.value || undefined,
       sortOrder: sortOrder.value || undefined,
     }),
-    store.fetchColumnLabels(tableName.value),
+    store.fetchColumnLabels(displayTable.value),
   ])
   if (!store.nav.design?.length && !store.nav.prep?.length && !store.nav.run?.length) {
     await store.fetchNavTables()
@@ -807,6 +1196,47 @@ async function load() {
     sortOrder.value = sortBy.value === 'id' ? 'desc' : 'asc'
   }
   loading.value = false
+  if (splitCfg.value && selectedParentKey.value != null) {
+    await loadChild()
+  }
+}
+
+function doChildSearch() {
+  childPagination.page = 1
+  loadChild()
+}
+
+function onChildPageChange(p) {
+  childPagination.page = p
+  loadChild()
+}
+
+function onChildPageSizeChange(ps) {
+  childPagination.pageSize = ps
+  childPagination.page = 1
+  loadChild()
+}
+
+function onChildSorter(s) {
+  const st = Array.isArray(s) ? s[0] : s
+  if (!st || st.order === false) {
+    childSortBy.value = null
+    childSortOrder.value = null
+    childPagination.page = 1
+    loadChild()
+    return
+  }
+  if (st.columnKey === '_child_actions') return
+  childSortBy.value = String(st.columnKey)
+  childSortOrder.value = st.order === 'ascend' ? 'asc' : 'desc'
+  childPagination.page = 1
+  loadChild()
+}
+
+function clearChildFilters() {
+  childGlobalSearch.value = ''
+  childPagination.page = 1
+  loadChild()
 }
 
 watch(
@@ -827,10 +1257,20 @@ watch(
   [schema, tableName],
   () => {
     undoStack.value = []
+    selectedParentKey.value = null
+    crudTarget.value = 'parent'
     manualOrder.value = loadStoredColumnOrder()
     globalSearch.value = ''
     for (const k of Object.keys(columnFilters)) delete columnFilters[k]
     filterClearGeneration.value++
+    childGlobalSearch.value = ''
+    childRows.value = []
+    childColDefs.value = []
+    childPagination.page = 1
+    childPagination.pageSize = 200
+    childPagination.itemCount = 0
+    childSortBy.value = 'id'
+    childSortOrder.value = 'desc'
     rows.value = []
     colDefs.value = []
     pagination.page = 1
@@ -1111,5 +1551,58 @@ onBeforeUnmount(() => {
 .th-text {
   flex: 1;
   min-width: 0;
+}
+
+.split-root {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  overflow: hidden;
+}
+
+.split-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  flex: 1 1 50%;
+  overflow: hidden;
+}
+
+.split-pane-title {
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
+}
+
+.split-hint {
+  font-size: 11px;
+  color: var(--text-3);
+  font-weight: 400;
+}
+
+.split-divider {
+  flex-shrink: 0;
+  height: 1px;
+  background: var(--border-hi);
+  margin: 4px 0;
+}
+
+.split-child-placeholder {
+  padding: 20px;
+  text-align: center;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+}
+
+.child-loading {
+  min-height: 120px;
+}
+
+:deep(.split-parent-row--selected td) {
+  background: var(--bg-active) !important;
+  box-shadow: inset 3px 0 0 0 var(--text-2);
 }
 </style>
