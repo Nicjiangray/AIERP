@@ -41,6 +41,12 @@ const routes = [
     component: () => import('../views/AiRulesView.vue'),
     meta: { title: 'AI 规则' }
   },
+  {
+    path: '/memory',
+    name: 'memory',
+    component: () => import('../views/MemoryView.vue'),
+    meta: { title: '记忆管理' }
+  },
 ]
 
 const router = createRouter({

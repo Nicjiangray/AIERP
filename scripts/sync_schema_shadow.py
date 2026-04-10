@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-从 meta.meta_tables / meta.meta_fields 生成影子表结构 JSON，写入 meta.prompts（prompt_code=schema_shadow）。
+从 meta.meta_tables / meta.meta_fields 生成紧凑纯文本「影子表结构」，写入 meta.prompts（prompt_code=schema_shadow）。
 
 范围（重要）：
     只包含 meta.meta_tables.include_in_domain_model = true 的表（LLM 领域模型开关）。
@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -29,8 +28,36 @@ import psycopg2.extras
 
 from tools.database import db_conn
 
+# 审计类字段：各表不再逐行列出（与旧版一致，减少噪音）
 EXCLUDE_FIELD_NAMES = frozenset(
     {"created_at", "updated_at", "deleted_at", "is_deleted", "created_by", "updated_by"}
+)
+
+# 公共字段：仅在文件头声明一次，各表字段列表中省略
+COMMON_FIELDS = frozenset(
+    {"id", "status", "notes", "created_at", "updated_at", "deleted_at"}
+)
+
+# 字段名已自明时不附加中文备注（第4条）
+SELF_EXPLANATORY_NAMES = frozenset(
+    {
+        "id",
+        "name",
+        "status",
+        "notes",
+        "phone",
+        "email",
+        "address",
+        "city",
+        "province",
+        "country",
+        "district",
+        "color",
+        "unit",
+        "quantity",
+        "currency",
+        "spec",
+    }
 )
 
 PROMPT_CODE = "schema_shadow"
@@ -69,33 +96,10 @@ def _parse_related_tables(raw: Any) -> List[Dict[str, Any]]:
     if isinstance(raw, dict):
         if not raw:
             return []
-        # 兼容误存为对象的情况
         if "items" in raw and isinstance(raw["items"], list):
             return [x for x in raw["items"] if isinstance(x, dict)]
         return []
     return []
-
-
-def _load_table_schema_map(cur) -> Dict[str, str]:
-    """table_name -> 实际 PostgreSQL schema（business / meta 等）。"""
-    cur.execute(
-        """
-        SELECT table_schema, table_name
-        FROM information_schema.tables
-        WHERE table_type = 'BASE TABLE'
-          AND table_schema NOT IN ('pg_catalog', 'information_schema')
-        """
-    )
-    out: Dict[str, str] = {}
-    for row in cur.fetchall():
-        schema, name = row["table_schema"], row["table_name"]
-        if name in out:
-            # 同名表优先保留 business
-            if out[name] != "business" and schema == "business":
-                out[name] = schema
-        else:
-            out[name] = schema
-    return out
 
 
 def _field_fk_string(
@@ -114,8 +118,28 @@ def _field_fk_string(
                 return note.strip()
             if ref_table:
                 return str(ref_table)
-        # has_many 的 fk 通常指子表上的列名，不挂在父表字段上；跳过
     return None
+
+
+def _compact_fk(fk_val: str) -> str:
+    """customers.id → →customers"""
+    s = fk_val.strip()
+    if s.endswith(".id"):
+        return "→" + s[:-3]
+    return "→" + s
+
+
+def _should_omit_field_comment(field_name: str, has_fk_arrow: bool) -> bool:
+    fn = field_name.lower()
+    if fn in SELF_EXPLANATORY_NAMES:
+        return True
+    if fn.endswith("_id") and has_fk_arrow:
+        return True
+    if fn.endswith("_name"):
+        return True
+    if fn.endswith("_date"):
+        return True
+    return False
 
 
 def _clip_relations_to_allowed(
@@ -124,7 +148,6 @@ def _clip_relations_to_allowed(
     fk_field: Optional[str],
     allowed: Set[str],
 ) -> Tuple[Optional[str], List[str], Optional[str]]:
-    """仅保留指向/来自「当前导出集合」内的父子关系，避免指向未纳入领域模型的表。"""
     ch = [c for c in children if c in allowed]
     pa = parent if (parent and parent in allowed) else None
     fk = fk_field if pa else None
@@ -137,9 +160,6 @@ def _derive_parent_child(
     related: List[Dict[str, Any]],
     all_rows: Sequence[Dict[str, Any]],
 ) -> Tuple[Optional[str], List[str], Optional[str]]:
-    """
-    返回 (parent_table_name | None, children_table_names, fk_field_to_parent | None)。
-    """
     children: List[str] = []
     for rel in related:
         if (rel.get("type") or "").lower() == "has_many" and rel.get("table"):
@@ -209,13 +229,87 @@ def _ensure_prompts_table(cur) -> None:
         )
 
 
+def _build_compact_schema_text(
+    table_rows: List[Dict[str, Any]],
+    fields_by_table: Dict[str, List[Dict[str, Any]]],
+) -> Tuple[str, int, int]:
+    """返回 (纯文本, 表数, 列数统计（不含公共/审计省略）)。"""
+    lines: List[str] = []
+    lines.append("== 业务表结构 ==")
+    lines.append("")
+    lines.append(
+        "公共字段（所有表默认包含，下方各表不再重复）："
+        "id(int 主键), status(string), notes(string), created_at, updated_at, deleted_at"
+    )
+    lines.append("")
+
+    field_count = 0
+    n_tables = len(table_rows)
+
+    for tr in table_rows:
+        tname = tr["table_name"]
+        related = _parse_related_tables(tr.get("related_tables"))
+        nav_parent = tr.get("nav_parent_table")
+
+        parent, children, fk_field = _derive_parent_child(
+            tname, nav_parent, related, table_rows
+        )
+        allowed: Set[str] = {r["table_name"] for r in table_rows}
+        parent, children, fk_field = _clip_relations_to_allowed(
+            parent, children, fk_field, allowed
+        )
+
+        table_cn = (tr.get("table_cn") or "").strip()
+        desc = (tr.get("description") or "").strip()
+        title_cn = table_cn or desc or tname
+
+        parts: List[str] = [f"{tname} {title_cn}"]
+        if children:
+            parts.append("children: " + ", ".join(children))
+        if parent:
+            ppart = f"parent: {parent}"
+            if fk_field:
+                ppart += f" via {fk_field}"
+            parts.append(ppart)
+
+        lines.append("---")
+        lines.append(" | ".join(parts))
+
+        for f in fields_by_table.get(tname, []):
+            fn = f["field_name"]
+            if fn in EXCLUDE_FIELD_NAMES or fn in COMMON_FIELDS:
+                continue
+            field_count += 1
+
+            typ = _simplify_type(f.get("data_type"))
+            req = "!" if bool(f.get("is_required")) else ""
+
+            raw_fk = _field_fk_string(related, fn)
+            fk_part = ""
+            has_arrow = False
+            if raw_fk is not None:
+                fk_part = " " + _compact_fk(raw_fk)
+                has_arrow = True
+
+            cn = (f.get("field_cn") or "").strip()
+            fdesc = (f.get("description") or "").strip()
+            hint = cn or fdesc
+
+            comment_part = ""
+            if hint and not _should_omit_field_comment(fn, has_arrow):
+                comment_part = " " + hint
+
+            lines.append(f"  {fn}{req} {typ}{fk_part}{comment_part}")
+
+    text = "\n".join(lines) + "\n"
+    return text, n_tables, field_count
+
+
 def main() -> None:
     with db_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             _ensure_include_in_domain_model_column(cur)
             _ensure_prompts_table(cur)
-
-            schema_by_table = _load_table_schema_map(cur)
 
             cur.execute(
                 """
@@ -247,70 +341,17 @@ def main() -> None:
             continue
         fields_by_table.setdefault(tn, []).append(fr)
 
-    output: List[Dict[str, Any]] = []
-    field_count = 0
-
-    for tr in table_rows:
-        tname = tr["table_name"]
-        related = _parse_related_tables(tr.get("related_tables"))
-        nav_parent = tr.get("nav_parent_table")
-
-        parent, children, fk_field = _derive_parent_child(
-            tname, nav_parent, related, table_rows
-        )
-        parent, children, fk_field = _clip_relations_to_allowed(
-            parent, children, fk_field, allowed
-        )
-
-        comment = (tr.get("description") or "").strip() or (
-            (tr.get("table_cn") or "").strip() or tname
-        )
-
-        fields_out: List[Dict[str, Any]] = []
-        for f in fields_by_table.get(tname, []):
-            fn = f["field_name"]
-            if fn in EXCLUDE_FIELD_NAMES:
-                continue
-            field_count += 1
-            cn = (f.get("field_cn") or "").strip()
-            desc = (f.get("description") or "").strip()
-            fcomment = cn or desc or fn
-            fd: Dict[str, Any] = {
-                "name": fn,
-                "type": _simplify_type(f.get("data_type")),
-                "comment": fcomment,
-            }
-            if bool(f.get("is_required")):
-                fd["required"] = True
-            fk_val = _field_fk_string(related, fn)
-            if fk_val is not None:
-                fd["fk"] = fk_val
-            fields_out.append(fd)
-
-        row: Dict[str, Any] = {
-            "table": tname,
-            "schema": schema_by_table.get(tname, "unknown"),
-            "comment": comment,
-            "fields": fields_out,
-        }
-        if children:
-            row["children"] = children
-        if parent is not None:
-            row["parent"] = parent
-        if fk_field is not None:
-            row["fk_field"] = fk_field
-        output.append(row)
-
-    payload = json.dumps(output, ensure_ascii=False, indent=2)
-    n_tables = len(output)
+    payload, n_tables, field_count = _build_compact_schema_text(
+        table_rows, fields_by_table
+    )
     content_len = len(payload)
     token_est = max(1, content_len // 4)
 
     record = {
         "prompt_code": PROMPT_CODE,
         "category": "schema",
-        "title": "数据库表结构（影子表）",
-        "summary": "所有业务表的结构定义，包含表名、字段、类型、注释、外键关系",
+        "title": "数据库表结构（影子表·紧凑文本）",
+        "summary": "领域表紧凑单行表示：表头含主从关系，字段含类型/必填/外键；公共字段仅在文首声明一次",
         "sort_order": 2,
         "inject_mode": "always",
         "source": "db_sync",
@@ -352,7 +393,8 @@ def main() -> None:
         conn.commit()
 
     print(
-        f"同步完成：include_in_domain_model 共 {n_tables} 张表，{field_count} 个字段（已排除审计字段名），"
+        f"同步完成（紧凑文本）：include_in_domain_model 共 {n_tables} 张表，"
+        f"{field_count} 个字段（已排除公共字段与审计字段名），"
         f"content 长度 {content_len} 字符，约 {token_est} tokens（粗略按 4 字符/token）。"
     )
 

@@ -20,7 +20,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from main import MAX_TOOL_ROUNDS, _extract_json_from_text  # noqa: E402
+from main import MAX_ORCHESTRATOR_ROUNDS, MAX_TOOL_ROUNDS, _extract_json_from_text  # noqa: E402
 
 
 def _assert(cond: bool, msg: str) -> None:
@@ -50,12 +50,13 @@ def test_nested_json_raw_decode() -> None:
 
 
 def test_max_tool_rounds_constant() -> None:
-    _assert(MAX_TOOL_ROUNDS == 3, "MAX_TOOL_ROUNDS 应为 3")
-    # 与 main 中 for _round in range(MAX_TOOL_ROUNDS) 一致：最多 3 次助手轮，不会无限循环
+    _assert(MAX_TOOL_ROUNDS == MAX_ORCHESTRATOR_ROUNDS, "MAX_TOOL_ROUNDS 应与 MAX_ORCHESTRATOR_ROUNDS 一致")
+    _assert(MAX_ORCHESTRATOR_ROUNDS == 30, "MAX_ORCHESTRATOR_ROUNDS 应为 30")
+    # 与 main 中外层 orchestrator 循环一致
     seen = 0
-    for _ in range(MAX_TOOL_ROUNDS):
+    for _ in range(MAX_ORCHESTRATOR_ROUNDS):
         seen += 1
-    _assert(seen == 3, "循环上限")
+    _assert(seen == 30, "循环上限")
 
 
 def smoke_http_if_configured() -> None:
@@ -85,7 +86,7 @@ def smoke_http_if_configured() -> None:
 def main() -> None:
     test_nested_json_raw_decode()
     test_max_tool_rounds_constant()
-    print("离线测试通过：_extract_json_from_text（嵌套） + MAX_TOOL_ROUNDS")
+    print("离线测试通过：_extract_json_from_text（嵌套） + MAX_ORCHESTRATOR_ROUNDS")
     smoke_http_if_configured()
 
 

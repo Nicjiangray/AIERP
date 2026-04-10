@@ -5,9 +5,18 @@ engine/prompt_builder.py
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 from tools.database import db_conn
+
+# 主助手注入记忆总长度上限；超出时先裁 session，再裁 longterm，core 不裁（可用环境变量覆盖）
+_MEMORY_INJECT_MAX_CHARS = int(os.environ.get("MEMORY_INJECT_MAX_CHARS") or "12000")
+
+_CORE_HEADER = (
+    "【核心经验】\n"
+    "（以下是你从长期工作中积累的业务规律和操作经验，优先参考）\n"
+)
 
 
 def build_prompt(agent_role: str, user_id: Optional[int] = None) -> str:
@@ -74,16 +83,48 @@ def build_prompt_on_demand(prompt_code: str) -> str:
             return row[0] if row else ""
 
 
+def _trim_end(s: str, max_len: int) -> str:
+    if max_len <= 0:
+        return ""
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 1].rstrip() + "…"
+
+
+def _pack_memory(core_text: str, longterm_text: str, session_text: str) -> str:
+    parts: list[str] = []
+    if core_text.strip():
+        parts.append(_CORE_HEADER + core_text.strip())
+    if longterm_text.strip():
+        parts.append("【长期记忆】\n" + longterm_text.strip())
+    if session_text.strip():
+        parts.append("【近期要点】\n" + session_text.strip())
+    return "\n\n".join(parts)
+
+
 def _load_user_memory(user_id: int) -> str:
     """
-    从 business.ai_memory 拉取用户记忆，拼成注入文本。
-    长期记忆 + 今日 session 记忆。
+    从 business.ai_memory 拉取用户记忆。
+    顺序：core → longterm → session；超长时先裁 session 正文，再裁 longterm 正文，core 正文不裁。
     """
-    sections: list[str] = []
+    core_lines: list[str] = []
+    longterm_body = ""
+    session_lines: list[str] = []
 
     with db_conn() as conn:
         with conn.cursor() as cur:
-            # 长期记忆（只有一条）
+            cur.execute(
+                """
+                SELECT content FROM business.ai_memory
+                WHERE user_id = %s AND scope = 'core'
+                ORDER BY id
+                """,
+                (user_id,),
+            )
+            for r in cur.fetchall():
+                if r and r[0] and str(r[0]).strip():
+                    core_lines.append(str(r[0]).strip())
+
             cur.execute(
                 """
                 SELECT content FROM business.ai_memory
@@ -94,9 +135,8 @@ def _load_user_memory(user_id: int) -> str:
             )
             row = cur.fetchone()
             if row and row[0]:
-                sections.append(f"【长期记忆】\n{row[0]}")
+                longterm_body = str(row[0]).strip()
 
-            # 今日 session 记忆
             cur.execute(
                 """
                 SELECT content FROM business.ai_memory
@@ -106,9 +146,35 @@ def _load_user_memory(user_id: int) -> str:
                 """,
                 (user_id,),
             )
-            rows = cur.fetchall()
-            if rows:
-                today_items = "\n".join(r[0] for r in rows)
-                sections.append(f"【今日记录】\n{today_items}")
+            for r in cur.fetchall():
+                if r and r[0] and str(r[0]).strip():
+                    session_lines.append(str(r[0]).strip())
 
-    return "\n\n".join(sections)
+    core_text = "\n".join(core_lines)
+    session_text = "\n".join(session_lines)
+
+    packed = _pack_memory(core_text, longterm_body, session_text)
+    if not packed:
+        return ""
+    if len(packed) <= _MEMORY_INJECT_MAX_CHARS:
+        return packed
+
+    # core 不裁；先减 session，再减 longterm
+    se = session_text
+    lt = longterm_body
+    budget = _MEMORY_INJECT_MAX_CHARS
+    cur_pack = packed
+    for _ in range(200):
+        cur_pack = _pack_memory(core_text, lt, se)
+        if len(cur_pack) <= budget:
+            return cur_pack
+        if se:
+            se = _trim_end(se, max(0, len(se) - max(80, len(se) // 4)))
+            continue
+        if lt:
+            lt = _trim_end(lt, max(0, len(lt) - max(80, len(lt) // 4)))
+            continue
+        # 仅 core 仍超长：整段返回（满足「core 不裁」）
+        return _pack_memory(core_text, "", "")
+
+    return cur_pack

@@ -17,7 +17,7 @@
 **Agent 分工**
 
 - **assistant**（主助手）：面向用户对话，注入人格、工具接口、记忆（长期记忆中可含「业务规律」小节）；只知工具调用格式，**不**注入表结构（`schema_shadow` 归 tool_expert）
-- **tool_expert**（工具专家）：注入表结构 + 工具执行细节；**V5** 起主路径为 **orchestrator 截获 `[TOOL]` → tool_expert（多步 SQL）**（见下方 **V5**）
+- **tool_expert**（工具专家）：由 orchestrator 在解析到 **`[TOOL]`** 后调用 **`_call_tool_expert`**，注入表结构 + `tool_expert_executor`；与主助手通过 **`[TOOL_RESULT]`** 闭环（见 **V5** 双层说明，非「单段对话直连接 expert」）
 - **memory_manager**（记忆管理员）：后台逻辑，负责 session 清洗与 longterm 压缩；对应 prompt 为 `on_demand` 拉取
 - **auditor**（审计员）：未实现，规划中
 
@@ -40,8 +40,9 @@
 **未完成（留待后续版本）**
 
 - 凌晨 cron 自动压缩
-- 新 session 开启时自动清洗上一 session
 - 业务规律提炼并写入 `meta.prompts`（如 `category=business_rule`）
+
+**已实现（会话衔接）**：登录用户每次 `POST /ai/chat` 且带有 `session_id` 时，若上一会话有 `ai_chat` 但未写入 session 要点，会先同步 `clean_session` 一次再拼 `build_prompt`（见 `memory_manager.maybe_clean_previous_session`）。
 - 前端展示记忆与业务规律
 
 > 对话主路径与 SQL 执行方式的演进见 **V5**（统一 `sql_engine`、orchestrator + tool_expert）。
@@ -58,12 +59,27 @@
 - **`preview_sql`**：审核写 SQL，生成中文摘要等，供用户确认（不提交事务）。
 - **`confirm_execute_sql`**：用户确认后执行经预览同一套 SQL（`/ai/confirm` 走此入口）。
 
-**assistant → orchestrator → tool_expert**
+**assistant → orchestrator → tool_expert（当前实现）**
 
-- 主助手在回复中输出 **`[TOOL] ... [/TOOL]`** 意图块（自然语言键值对：**不含**表名、字段名），仅表达「要查什么 / 改什么」。
-- **`main.py` 中 orchestrator** 解析该块，将内容作为 user 消息交给 **tool_expert**（`build_prompt('tool_expert')`，含 `schema_shadow` + `tool_expert_executor`）。
-- **tool_expert** 内部多步闭环（最多 **5** 步）：每步输出一个 JSON（`type: query` 调 `execute_sql`，`type: write` 调 `preview_sql`），系统将执行结果贴回对话，直到 `done` 或预览成功；结果以 **`[TOOL_RESULT] ... [/TOOL_RESULT]`** 回注主助手下一轮。
-- **职责**：助手负责业务规划（对用户说话、收信息），**无表结构**；expert 负责操作规划（写 SQL、查 id），**无用户对话上下文**。
+链路分**两层**，请勿与旧文档混淆：
+
+1. **外层：`/ai/chat` orchestrator（`main.py`）**  
+   - 最多 **`MAX_ORCHESTRATOR_ROUNDS`（当前 30）** 轮「主助手 ↔ 工具结果」循环；**`MAX_TOOL_ROUNDS`** 为其**历史别名**，与内层 **`MAX_EXPERT_STEPS`（当前 30）** 不是同一概念（见下）。  
+   - 每轮：主模型生成完整回复 → 解析是否含 **`[TOOL] ... [/TOOL]`**（意图块，自然语言键值对，**不含**表名/字段名）。  
+   - **若无 `[TOOL]`**：本请求结束。  
+   - **若有 `[TOOL]`**：SSE 对用户**只展示** `[TOOL]` **之前**的正文（块内与 `[/TOOL]` 之后续写均不下发）；再下发「请稍等......」→ 调用内层 **`_call_tool_expert`** → 将 **`[TOOL_RESULT] ... [/TOOL_RESULT]`** 作为 **user** 消息贴回 `work_msgs`，进入下一轮主模型（外层最多 30 轮；另有空转检测与客户端断开终止，见 `main.py`）。  
+   - **主模型选型**：默认 **`chat` / `chat_stream`**（常规主助手）；请求体带 **`inviteExpert: true`** 时，主模型改为 **`chat_expert_only`**（仍走同一 `[TOOL]` 与 orchestrator 逻辑，仅换主模型）。
+
+2. **内层：`_call_tool_expert`（tool_expert 专用会话）**  
+   - System：`build_prompt('tool_expert')`（**`schema_shadow` + `tool_expert_executor`** 等）。  
+   - User：外层解析出的 **`[TOOL]` 块内容**（外加 orchestrator 注入的说明），**不是**把整段主助手对话交给 expert。  
+   - Expert 在**独立多轮 JSON** 中执行：`type: query` → **`execute_sql`**，`type: write` → **`preview_sql`**，直至 `done` 或单条/多条写入预览就绪；最多 **`MAX_EXPERT_STEPS`（当前 30）** 步（适合多行合同、多 `write` 再 `done` 汇总）。  
+   - 返回给外层的是结构化结果，由 **`_format_tool_result`** 包成 **`[TOOL_RESULT]`** 字符串，供主助手下一轮使用。
+
+3. **写入确认与重试**  
+   - 预览成功 → 前端 **`/ai/confirm`** 执行 **`confirm_batch_sql`** 等；执行/意图校验失败时由 **`_call_tool_expert_recover_after_failed_confirm`** 再跑内层 expert，最多 **`MAX_WRITE_CONFIRM_ATTEMPTS`（当前 3）** 次，与 **`MAX_EXPERT_STEPS`**（内层 expert 步数）、**`MAX_ORCHESTRATOR_ROUNDS`**（外层轮数）无关。
+
+4. **职责划分**：主助手面向用户与 **`[TOOL]` 意图**；**tool_expert** 面向 **SQL + `params`** 与库表结构，通过 orchestrator 与 **`sql_engine`** 对接。
 
 **登录系统**
 
@@ -89,11 +105,45 @@
 
 ---
 
+### V6：业务表扩展 + Orchestrator 多步（2026-04）
+
+**业务表（`business` schema，迁移见 `constitution/`）**
+
+- **采购**：`suppliers`（供应商）、`purchase_orders`、`purchase_order_items`（含 `delivered_qty`、`source_contract_item_id` 等）  
+- **物流**：`receiving_notes`、`receiving_note_items`（到货）；`shipping_notes`、`shipping_note_items`（发货；明细可关联 `inventory_id`）  
+- **收付款与库存**：`payments`、`payment_allocations`；`inventory`（按产品/批次等）  
+- **字段修订**：`contract_items.expected_delivery_date`、`purchase_order_items.expected_delivery_date`（交期下钻子表；主表交期列保留但标注弃用）；`contract_items.shipped_qty`；`contracts.received_amount`  
+
+**Orchestrator**
+
+- 外层循环上限：**`MAX_ORCHESTRATOR_ROUNDS = 30`**（**`MAX_TOOL_ROUNDS`** 为同义旧名）；内层单次 **`[TOOL]`** 内 expert 仍由 **`MAX_EXPERT_STEPS`** 约束，二者独立。  
+- 连续相同 `(action, intent)` 空转检测、跑满轮数提示、SSE 断开时写入系统消息；**`role_rules`** 追加多步骤任务说明（迁移 **`v13_role_rules_multistep_orchestrator.sql`**）。
+
+**记忆（`ai_memory`）**
+
+- 第三层 **`scope=core`**（核心经验）：由 **`memory_core_extract`** 在 **`compress_longterm`** 完成后自动提炼，或 **`POST /ai/memory/extract-core`** 手动触发；主助手注入顺序为 **core → longterm → session（近期要点）**，超长时先裁 session、再裁 longterm，**core 不裁**（见 `MEMORY_INJECT_MAX_CHARS`）。  
+- 前端 **`/memory`** 可查看/编辑 **`core`** 与 **`longterm`**（不展示 session）。
+
+**相关迁移（节选）**
+
+| 文件 | 作用 |
+|------|------|
+| **`v10_purchasing_suppliers_po.sql`** | 供应商 + 采购订单 + 采购明细 |
+| **`nav_purchasing_tables.sql`** | `meta.meta_tables` 导航：采购主从表等 |
+| **`v11_receiving_shipping_tables.sql`** | 到货单/发货单四表 + `contract_items.shipped_qty` |
+| **`v12_payments_inventory_delivery_fix.sql`** | 收付款、分配、库存、`shipping_note_items.inventory_id`、交期迁移、`contracts.received_amount`；末尾含 `sync_constitution` 与导航更新 |
+| **`v13_role_rules_multistep_orchestrator.sql`** | `role_rules` 追加多步骤任务规则 |
+| **`v14_ai_memory_scope_core_and_prompt.sql`** | `ai_memory` 允许 **`core`**；`memory_core_extract` 提示词 |
+
+改表后请按 **「元数据流水线」** 一节执行 `CALL meta.sync_constitution()` 与 `scripts/sync_meta_pipeline.py`（若 `v12` 已跑过同步，仅新增 `v13` 时可只更新 prompts 或按需全量同步）。
+
+---
+
 ## 项目目录结构概览
 
 ```
 aierp/
-├── main.py                 # FastAPI：表 CRUD、/auth/*、/ai/chat（orchestrator）、/ai/memory/*、/ai/confirm
+├── main.py                 # FastAPI：表 CRUD、/auth/*、/ai/chat（orchestrator+[TOOL]）、/ai/chat/log-message、/ai/memory/*、/ai/confirm
 ├── engine/                 # sql_engine、prompt_builder、memory_manager；query/write_engine 已 deprecated
 ├── llm/                    # OpenAI 兼容客户端（chat / 流式 / 附件解析）；intent 为占位
 ├── tools/                  # 连接池、通用 DB 读写与会话 memo 等辅助
@@ -149,10 +199,16 @@ aierp/
 | `/table/{schema}/{table_name}/{row_id}` | DELETE | 硬删除一行 | 可用 |
 | **`/auth/login`** | **POST** | **body：`{ login_name, password }`**；bcrypt 校验 **`business.user_accounts`**；返回 **`user`**（`id`=`employees.id`） | 可用 |
 | **`/auth/me`** | **GET** | **Query：`user_id`**（员工 id）；返回 **`{ user: {...} }`**，不存在则 404 | 可用 |
-| `/ai/confirm` | POST | 执行经 **`preview_sql`** 审核的写 SQL：**`payload` 须含 `sql`、可选 `params`（数组）** → `confirm_execute_sql` | 可用 |
-| `/ai/chat` | POST | **orchestrator**：`build_prompt('assistant', user_id)` + 流式/非流式 LLM；若回复含 **`[TOOL]`** 则调用 **tool_expert**（多步 `execute_sql` / `preview_sql`），以 **`[TOOL_RESULT]`** 回注；**SSE** 默认；传 **`user_id`** 时自动建 **`ai_sessions`** 并写 **`ai_chat`** | 可用 |
+| `/ai/confirm` | POST | 执行经 **`preview_sql`** 审核的写 SQL：`payload` 含 **`batch`** 或单条 **`sql`/`params`**；可选 **`session_id`** 将成功/失败收尾句写入 **`ai_chat`** | 可用 |
+| `/ai/chat/log-message` | POST | 将一条 **`assistant` / `user` / `tool` / `system`** 消息追加写入 **`ai_chat`**（如取消写入、终止流、前端异常提示） | 可用 |
+| `/ai/chat` | POST | **双层 orchestrator**：`build_prompt('assistant', user_id)` + 主模型（默认 **`chat`/`chat_stream`**，可选 **`inviteExpert: true`** → **`chat_expert_only`**）；若回复含 **`[TOOL]`** → **`_call_tool_expert`**（内层多步 **`execute_sql`/`preview_sql`**，见上节）；**SSE** 默认；**`user_id`** 时建 **`ai_sessions`** 并写 **`ai_chat`** | 可用 |
 | `/ai/memory/clean-session` | POST | 手动触发 session 清洗，要点写入 `business.ai_memory`（`scope=session`） | 可用（body：`{"session_id": <int>}`） |
-| `/ai/memory/compress-longterm` | POST | 手动触发长期记忆压缩，覆盖/写入 `scope=longterm` | 可用（body：`{"user_id": <int>}`） |
+| `/ai/memory/compress-longterm` | POST | 手动触发长期记忆压缩，覆盖/写入 `scope=longterm`；成功后**顺带**调用 `extract_core_facts` 更新 `scope=core` | 可用（body：`{"user_id": <int>}`） |
+| `/ai/memory/extract-core` | POST | 仅提炼核心经验（写入 `scope=core`） | 可用（body：`{"user_id": <int>}`） |
+| `/ai/memory` | GET | `user_id` + `scope`（`core` \| `longterm`）列记忆行 | 可用 |
+| `/ai/memory` | POST | 新增一条 `core` 或 `longterm`：`{ user_id, scope, content }` | 可用 |
+| `/ai/memory/{id}` | PATCH | 更新内容：`{ user_id, content }`（仅 `core`/`longterm`） | 可用 |
+| `/ai/memory/{id}` | DELETE | `?user_id=` 与记录一致时删除 | 可用 |
 | `/ai/chat`（`pendingToken`） | POST | — | **未联通**：显式返回 400，提示不支持恢复 |
 | `/ai/chat`（`confirm: true`） | POST | — | **未联通**：显式返回 400，提示不在此确认 DB |
 
@@ -173,11 +229,12 @@ aierp/
 | `stores/app.js` | 请求 `http://localhost:8000` 的 `/tables`、`/nav/tables`、`/table-columns`、`/table/...`、导出 URL、表 CRUD | 可用 |
 | `components/NavPanel.vue` | 侧栏导航；**展示当前用户名 + 退出** | 可用 |
 | `components/DataNavPanel.vue` | 数据侧导航（与表拆分配置配合） | 可用 |
-| `components/AiPanel.vue` | AI 对话：SSE **`/ai/chat`**、**`/ai/confirm`**；请求体 **`user_id` 取自 `useAuthStore().currentUser?.id`**（与登录态一致） | 可用 |
+| `components/AiPanel.vue` | AI 对话：SSE **`/ai/chat`**、**`/ai/confirm`**；加载中可 **「终止」** 中断 SSE；请求体 **`user_id` 取自 `useAuthStore().currentUser?.id`**（与登录态一致） | 可用 |
 | `views/DashboardView.vue` | 仪表盘占位 | 可用 |
 | `views/MetaView.vue` / `BusinessView.vue` | 元数据/业务表列表入口 | 可用 |
 | `views/TableView.vue` | 通用表浏览与编辑 | 可用 |
 | `views/AiRulesView.vue` | 展示 `meta.ai_rules` 表数据 | 可用 |
+| `views/MemoryView.vue` | **记忆管理**：`core` / `longterm` 查看与增删改（`/ai/memory`） | 可用 |
 | `config/tableSplit.js` | 表拆分配置 | 可用 |
 | `utils/tableExport.js` | 导出 xlsx URL 构造 | 可用 |
 
@@ -187,9 +244,9 @@ aierp/
 
 - **表数据与导航**：前端 `stores/app.js` ↔ 后端表 API（`/tables`、`/nav/tables`、`/table/...`、导出）**已串通**。
 - **登录**：`LoginView` → **`/auth/login`**；刷新 **`/auth/me`**；**`AiPanel` 携带同一 `user_id`** → **已实现（待测试）**。
-- **对话主链路**：用户输入 → `AiPanel` → `POST /ai/chat`（SSE）→ **`build_prompt('assistant')`** + LLM；若含 **`[TOOL]`** → **orchestrator** → **tool_expert**（多步 **`sql_engine`**）→ **`[TOOL_RESULT]`** 回注 → **已实现（待测试）**。
-- **查询 / 写入（经 tool_expert）**：自然语言意图 → **`[TOOL]`** → expert 产出 **SQL** → `execute_sql` / `preview_sql` → 前端确认 → **`/ai/confirm`**（`sql`+`params`）→ **`confirm_execute_sql`** → **已实现（待测试）**（旧版 `query_engine.execute_query` 与结构化 `preview_write` 主路径已弃用）。
-- **记忆系统**：**已串联（手动触发）**——`clean-session` / `compress-longterm` 写入 `business.ai_memory`；主助手注入长期 + 今日 session 要点；**自动**定时清洗/压缩 **仍待实现**。
+- **对话主链路**：用户输入 → `AiPanel` → `POST /ai/chat`（SSE）→ **外层**主模型 + **`[TOOL]`** → **`_call_tool_expert`**（内层）→ **`sql_engine`**；**`[TOOL_RESULT]`** 回注外层，外层最多 **`MAX_ORCHESTRATOR_ROUNDS`（与 `MAX_TOOL_ROUNDS` 同义，当前 30）** 轮；详见上文 **「assistant → orchestrator → tool_expert」**。流式进行中可点 **「终止」** 断开 SSE；服务端可写入系统提示「用户已终止自动执行。」
+- **查询 / 写入**：意图块 **`[TOOL]`** → 内层 expert 产出 **SQL** → `execute_sql` / `preview_sql` → 前端确认 → **`/ai/confirm`**（`payload` + 可选 **`session_id`**）→ **`confirm_batch_sql`**（旧版结构化 query/write 主路径已弃用）。
+- **记忆系统**：`clean-session` / `compress-longterm` 写入 `business.ai_memory`；主助手注入长期 + 今日 session 要点；**新开聊时若上一会话未整理则自动 `clean_session` 一次**（见上）；凌晨定时压缩仍待实现。
 - **会话持久化**：**已联通**——提供有效 **`user_id`**（登录态）时自动建 **`ai_sessions`** 并写 **`ai_chat`**（须满足 `employees` 外键）。
 
 ---
@@ -212,7 +269,7 @@ aierp/
 
 1. `CALL meta.sync_constitution()` — 从 `information_schema` 重建 `meta_tables` / `meta_fields`
 2. `scripts/sync_meta_cn.py` — 为空 `field_cn` 批量填中文（依赖 `.env` 里 `LLM_*`）
-3. `scripts/sync_schema_shadow.py` — 按 `include_in_domain_model` 裁剪后写入 `meta.prompts`（`prompt_code = schema_shadow`）
+3. `scripts/sync_schema_shadow.py` — 按 `include_in_domain_model` 裁剪后生成**紧凑纯文本**（非 JSON），写入 `meta.prompts`（`prompt_code = schema_shadow`）
 
 一键（根目录）：
 
@@ -249,10 +306,22 @@ aierp/
 | **`v5_2_tool_expert_multistep.sql`** | **V5.2**：`tool_expert_executor` 最终版——**多步 query/write + `done`**；**停用 `tool_query` / `tool_write`**（`is_active=false`） |
 | **`v5_auth_employees_last_login.sql`** | **V5**：`business.employees.last_login_at`（登录成功时可选更新） |
 | **`v5_seed_xiaowang_account.sql`** | **V5**：测试账号种子（可选） |
+| **`v6_role_rules_erp_operator_data_only.sql`** | **V6**：`role_rules` + `tool_query_interface`——主助手为 **ERP 操作员**，业务事实须先 `[TOOL]` 查库，禁止编造 |
+| **`v7_tool_expert_plan_then_execute.sql`** | **V7**：`tool_expert_executor`——**先规划步骤再执行**；合同/多表写入对齐 schema；与引擎无参 `LIKE '%x%'` 修复配合 |
+| **`v8_tool_expert_contract_write_one_round.sql`** | **V8**：`tool_expert_executor`——**首个 `write` 预览成功即结束专家轮次**；合同+行项目须 **一条 SQL（CTE）** 或确认主表后再聊子表 |
+| **`v9_tool_expert_multi_write_then_done.sql`** | **V9**：在 `tool_expert_executor` 末尾追加说明——**多条 write 暂存后 `done` 汇总**；与 orchestrator 多写入一致 |
 | `update_role_rules_memory_prompt.sql` | 更新 `role_rules` 全文（记忆与数据规则） |
 | `alter_ai_sessions_status_default.sql` | `ai_sessions.status` 默认 `in_progress` |
 | `fix_ai_chat_primary_key_if_wrong.sql` | 若误将 `ai_chat` 主键建在 `session_id` 上则修复为 `id`（正常库为 no-op） |
 | `drop_business_feedback.sql` / `drop_business_sessions_frames_slots_turns.sql` / `nav_workflow_contract_items.sql` | 按需：删旧表或导航种子（见各文件头注释） |
+| **`drop_workflows_tables.sql`** | 删除 **`workflows` / `workflow_steps` / `workflow_steps_legacy`**；末尾 **`CALL meta.sync_constitution()`** |
+| **`v10_purchasing_suppliers_po.sql`** | **V6**：供应商、采购订单、采购明细（见上节「V6」） |
+| **`nav_purchasing_tables.sql`** | **V6**：侧栏数据导航：供应商与采购主从 |
+| **`v11_receiving_shipping_tables.sql`** | **V6**：到货/发货四表 + `contract_items.shipped_qty` |
+| **`v12_payments_inventory_delivery_fix.sql`** | **V6**：收付款、库存、交期子表、发货关联库存等（见上节） |
+| **`v13_role_rules_multistep_orchestrator.sql`** | **V6**：`role_rules` 多步骤任务与征得同意 |
+| **`v14_ai_memory_scope_core_and_prompt.sql`** | **V6**：`ai_memory.scope` 增加 **`core`**；`meta.prompts` 插入 **`memory_core_extract`** |
+| **`v15_comment_new_tables.sql`** | **V6**：新建十张业务表及若干新增列的 **COMMENT ON TABLE/COLUMN**（中文）；末尾 **`CALL meta.sync_constitution()`** |
 
 执行示例：
 
@@ -277,7 +346,7 @@ psql -U nicjiang -d aierp -f constitution/create_meta_prompts.sql
 | `role_rules` | assistant | 人格与行为规则 |
 | `tool_query_interface` | assistant | **V5 重写**：意图级菜单，约定 **`[TOOL]`**（自然语言意图，**不含**表名/字段名） |
 | `tool_write_interface` | assistant | **V5 重写**：同上 |
-| `schema_shadow` | tool_expert | 领域表结构 JSON（`include_in_domain_model` 裁剪） |
+| `schema_shadow` | tool_expert | 领域表结构紧凑文本（`include_in_domain_model` 裁剪；公共字段仅文首声明） |
 | **`tool_expert_executor`** | **tool_expert** | **V5 新增**：教 expert 输出 **`type: query|write`** 的 JSON + 多步闭环 + **`done`**；与 **`sql_engine`** 执行链路一致 |
 | `tool_query` | tool_expert | **V5 停用**（`is_active=false`）：旧版结构化 query 说明，由 SQL 路径取代 |
 | `tool_write` | tool_expert | **V5 停用**（`is_active=false`）：旧版结构化 write 说明，由 SQL 路径取代 |
@@ -290,5 +359,5 @@ psql -U nicjiang -d aierp -f constitution/create_meta_prompts.sql
 
 ## 其他脚本（按需）
 
-- `scripts/sync_schema_shadow.py`：单独生成 schema 影子 JSON 到 `meta.prompts`
+- `scripts/sync_schema_shadow.py`：单独生成 schema 影子（紧凑文本）到 `meta.prompts`
 - `scripts/sync_meta_cn.py`：单独补字段中文名

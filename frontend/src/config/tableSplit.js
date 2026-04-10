@@ -4,14 +4,6 @@
  * child.fk：子表上的列名。
  */
 export const TABLE_SPLIT = {
-  workflows: {
-    parent: { schema: 'business', table: 'workflows', key: 'intent' },
-    child: { schema: 'business', table: 'workflow_steps', fk: 'workflow_intent' },
-  },
-  workflow_steps: {
-    parent: { schema: 'business', table: 'workflows', key: 'intent' },
-    child: { schema: 'business', table: 'workflow_steps', fk: 'workflow_intent' },
-  },
   contracts: {
     parent: { schema: 'business', table: 'contracts', key: 'id' },
     child: { schema: 'business', table: 'contract_items', fk: 'contract_id' },
@@ -19,6 +11,22 @@ export const TABLE_SPLIT = {
   contract_items: {
     parent: { schema: 'business', table: 'contracts', key: 'id' },
     child: { schema: 'business', table: 'contract_items', fk: 'contract_id' },
+  },
+  purchase_orders: {
+    parent: { schema: 'business', table: 'purchase_orders', key: 'id' },
+    child: { schema: 'business', table: 'purchase_order_items', fk: 'po_id' },
+  },
+  purchase_order_items: {
+    parent: { schema: 'business', table: 'purchase_orders', key: 'id' },
+    child: { schema: 'business', table: 'purchase_order_items', fk: 'po_id' },
+  },
+  payments: {
+    parent: { schema: 'business', table: 'payments', key: 'id' },
+    child: { schema: 'business', table: 'payment_allocations', fk: 'payment_id' },
+  },
+  payment_allocations: {
+    parent: { schema: 'business', table: 'payments', key: 'id' },
+    child: { schema: 'business', table: 'payment_allocations', fk: 'payment_id' },
   },
 }
 

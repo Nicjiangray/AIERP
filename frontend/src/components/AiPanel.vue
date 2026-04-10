@@ -9,9 +9,9 @@
           type="button"
           class="stop-btn"
           @click="stopGeneration"
-          title="停止生成（中断与本地模型的连接）"
+          title="终止自动执行（断开 SSE，多步任务可随时中断）"
         >
-          ■
+          终止
         </button>
         <button class="clear-btn" type="button" @click="clearChat" title="清空对话">⊘</button>
       </div>
@@ -205,6 +205,11 @@
           </div>
         </template>
 
+        <template v-else-if="msg.role === 'system'">
+          <div class="msg-meta mono">系统</div>
+          <div class="msg-body msg-system-line">{{ msg.content }}</div>
+        </template>
+
         <template v-else>
         <div class="msg-meta mono">{{ msg.role === 'user' ? '你' : 'AI' }}</div>
         <div class="msg-body" v-html="renderMarkdown(msg.content)"></div>
@@ -263,7 +268,28 @@
           class="msg-write-preview-card"
         >
           <div class="msg-confirm-title">请确认以下操作</div>
-          <div class="msg-write-preview-body">{{ msg.writePreview.summary }}</div>
+          <div class="msg-write-preview-section">
+            <div class="msg-write-preview-label">操作确认</div>
+            <div
+              class="msg-write-preview-body"
+              v-html="highlightedWritePreviewSummary(msg.writePreview)"
+            ></div>
+          </div>
+          <div
+            v-if="writePreviewExpertExplanation(msg.writePreview)"
+            class="msg-write-preview-expert"
+          >
+            <div class="msg-write-preview-label msg-write-preview-label-sub">操作说明</div>
+            <div class="msg-write-preview-expert-text">
+              {{ writePreviewExpertExplanation(msg.writePreview) }}
+            </div>
+          </div>
+          <p
+            v-if="msg.writePreview.payload?.batch?.length > 1"
+            class="msg-write-preview-meta"
+          >
+            共 {{ msg.writePreview.payload.batch.length }} 条 SQL，确认后同一事务顺序执行
+          </p>
           <div class="msg-write-preview-actions">
             <button
               type="button"
@@ -302,8 +328,16 @@
 
     <!-- 输入框 -->
     <div class="ai-composer">
-      <div class="ai-expert-hint">
-        <span class="ai-expert-label">邀请专家</span>
+      <div class="ai-memory-hint">
+        <span class="ai-memory-label" title="当前会话对话清洗为要点，写入 ai_memory(scope=session)"
+          >会话要点</span
+        >
+        <span class="ai-memory-sep" aria-hidden="true">·</span>
+        <span
+          class="ai-memory-label"
+          title="合并今日 session 要点与旧 longterm，写入 ai_memory(scope=longterm)，供后续对话注入"
+          >长期记忆</span
+        >
       </div>
       <div class="ai-input-wrap">
         <button class="plus-btn" @click="triggerFilePicker" :disabled="loading" title="上传文件">
@@ -326,13 +360,21 @@
         />
         <button
           type="button"
-          class="expert-btn"
-          :class="{ 'expert-btn-on': inviteExpert }"
-          :disabled="loading"
-          title="开启后本轮使用云端专家模型（DeepSeek），不自动从本地切换"
-          @click="inviteExpert = !inviteExpert"
+          class="memory-btn"
+          :disabled="loading || memoryLoading || longtermMemoryLoading || !chatSessionId"
+          title="将当前会话对话清洗为要点，写入 ai_memory（scope=session），供后续注入"
+          @click="generateSessionMemory"
         >
-          <span class="expert-glyph" aria-hidden="true">🎓</span>
+          <span class="memory-glyph" aria-hidden="true">🧠</span>
+        </button>
+        <button
+          type="button"
+          class="memory-btn memory-btn-longterm"
+          :disabled="loading || memoryLoading || longtermMemoryLoading || !authStore.currentUser?.id"
+          title="手动触发长期记忆压缩（等同日后定时任务），需已登录"
+          @click="compressLongtermMemory"
+        >
+          <span class="memory-glyph" aria-hidden="true">📦</span>
         </button>
         <button class="send-btn" @click="handleSend" :disabled="loading || !inputText.trim()">
           <span>↑</span>
@@ -344,6 +386,32 @@
 
 <script setup>
 import { ref, nextTick } from 'vue'
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
+/** 写入预览摘要：将后端下发的危险词标红加粗 */
+function highlightedWritePreviewSummary(wp) {
+  let text = escapeHtml(wp?.summary || '')
+  const words = wp?.highlight_words || []
+  words.forEach((w) => {
+    const kw = String(w)
+    if (!kw) return
+    text = text.replaceAll(kw, `<span style="color: #e53e3e; font-weight: bold;">${escapeHtml(kw)}</span>`)
+  })
+  return text
+}
+
+/** LLM expert 业务说明（与引擎 summary 分列展示） */
+function writePreviewExpertExplanation(wp) {
+  const t = wp?.expert_explanation ?? wp?.payload?.expert_explanation
+  return t != null && String(t).trim() !== '' ? String(t).trim() : ''
+}
 import { useAuthStore } from '../stores/auth'
 
 const authStore = useAuthStore()
@@ -447,10 +515,31 @@ const chatSessionId = ref(null)
 const lastFrameId = ref(null)
 const lastErrorMessage = ref(null)
 
-function cancelWritePreview(idx) {
+/** 将仅发生在前端的收尾文案同步到服务端 ai_chat（确认结果由 /ai/confirm 写入） */
+async function logChatMessageToServer(content, role = 'assistant') {
+  const sid = chatSessionId.value
+  if (sid == null || !content) return
+  try {
+    await fetch(`${API_BASE}/ai/chat/log-message`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sid, content, role }),
+    })
+  } catch {
+    /* 不影响主流程 */
+  }
+}
+
+async function cancelWritePreview(idx) {
   const m = messages.value[idx]
   if (!m?.writePreview) return
   messages.value[idx] = { ...m, writePreview: null }
+  messages.value.push({
+    role: 'assistant',
+    content: '您已经取消任务。',
+  })
+  await logChatMessageToServer('您已经取消任务。')
+  await scrollToBottom()
 }
 
 async function confirmWritePreview(idx) {
@@ -461,7 +550,10 @@ async function confirmWritePreview(idx) {
     const res = await fetch(`${API_BASE}/ai/confirm`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ payload: m.writePreview.payload }),
+      body: JSON.stringify({
+        payload: m.writePreview.payload,
+        session_id: chatSessionId.value,
+      }),
     })
     const data = await res.json().catch(() => ({}))
     if (!res.ok) {
@@ -469,16 +561,24 @@ async function confirmWritePreview(idx) {
       throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail))
     }
     messages.value[idx] = { ...m, writePreview: null }
-    const line = data.success
-      ? `✅ 已执行：${data.operation || ''} 表 ${data.table || ''}，id=${data.id ?? ''}`
-      : `❌ 执行失败：${data.error || '未知错误'}`
+    let line
+    if (data.success) {
+      const vm = typeof data.verify_message === 'string' ? data.verify_message.trim() : ''
+      line = vm ? `✅ ${vm}` : '✅ 已经按照您的要求完成任务。'
+    } else {
+      line = data.task_failed
+        ? `❌ ${data.error || '任务失败'}`
+        : `❌ 执行失败：${data.error || '未知错误'}`
+    }
     messages.value.push({ role: 'assistant', content: line })
     await scrollToBottom()
   } catch (e) {
+    const errLine = `⚠ 确认执行失败：${e?.message || e}`
     messages.value.push({
       role: 'assistant',
-      content: `⚠ 确认执行失败：${e?.message || e}`,
+      content: errLine,
     })
+    await logChatMessageToServer(errLine)
     await scrollToBottom()
   } finally {
     loading.value = false
@@ -527,18 +627,22 @@ async function onConfirmEntityWrite(idx) {
         : isErr
           ? detail
           : '✅ 已写入'
+    const outLine = isErr ? `❌ ${detail}` : done
     messages.value.push({
       role: 'assistant',
-      content: isErr ? `❌ ${detail}` : done,
+      content: outLine,
       confirmExecError: !!isErr,
     })
+    await logChatMessageToServer(outLine)
     await scrollToBottom()
   } catch (e) {
+    const errLine = `⚠ ${e?.message || '确认失败'}`
     messages.value.push({
       role: 'assistant',
-      content: `⚠ ${e?.message || '确认失败'}`,
+      content: errLine,
       confirmExecError: true,
     })
+    await logChatMessageToServer(errLine)
     await scrollToBottom()
   } finally {
     loading.value = false
@@ -553,12 +657,15 @@ async function onCancelEntityWrite(idx) {
     await postAiConfirm(msg.frameId, false)
     messages.value.splice(idx, 1)
     messages.value.push({ role: 'assistant', content: '已取消' })
+    await logChatMessageToServer('已取消')
     await scrollToBottom()
   } catch (e) {
+    const errLine = `⚠ ${e?.message || '取消失败'}`
     messages.value.push({
       role: 'assistant',
-      content: `⚠ ${e?.message || '取消失败'}`,
+      content: errLine,
     })
+    await logChatMessageToServer(errLine)
     await scrollToBottom()
   } finally {
     loading.value = false
@@ -585,8 +692,10 @@ const fileInputRef = ref(null)
 const pendingFiles = ref([]) // 后端需要的 "<filename>|<base64>" 字符串数组
 /** @type {import('vue').Ref<AbortController | null>} */
 const chatAbortController = ref(null)
-/** 为 true 时本轮请求走云端专家模型（DeepSeek），仅本地/仅专家，无自动 fallback */
-const inviteExpert = ref(false)
+/** 生成会话记忆（调用 /ai/memory/clean-session）进行中 */
+const memoryLoading = ref(false)
+/** 长期记忆压缩（调用 /ai/memory/compress-longterm）进行中 */
+const longtermMemoryLoading = ref(false)
 
 function stopGeneration() {
   chatAbortController.value?.abort()
@@ -655,6 +764,7 @@ function applySessionFromSseStart(payload) {
 function buildApiHistory() {
   const step1 = messages.value.filter((m) => {
     if (!m || !m.role) return false
+    if (m.role === 'system') return false
     if (m.role === 'assistant') {
       const c = (m.content || '').trim()
       const hasTable = (m.tableMain && m.tableMain.length > 0) || (m.tableSub && m.tableSub.length > 0)
@@ -699,6 +809,77 @@ async function scrollToBottom() {
   await nextTick()
   if (chatBodyRef.value) {
     chatBodyRef.value.scrollTop = chatBodyRef.value.scrollHeight
+  }
+}
+
+/** 调用后端清洗当前会话 → 写入 business.ai_memory（scope=session） */
+async function generateSessionMemory() {
+  if (!chatSessionId.value) return
+  memoryLoading.value = true
+  try {
+    const res = await fetch(`${API_BASE}/ai/memory/clean-session`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: chatSessionId.value }),
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) {
+      const detail = data?.detail || data?.message || data?.error || '请求失败'
+      throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail))
+    }
+    const full = data.content || ''
+    const preview = full.length > 800 ? `${full.slice(0, 800)}…` : full
+    messages.value.push({
+      role: 'assistant',
+      content:
+        `✅ 已生成会话记忆并写入库（scope=session，session_id=${data.session_id ?? chatSessionId.value}）。\n\n` +
+        (preview ? `要点预览：\n${preview}` : '（内容为空）'),
+    })
+    await scrollToBottom()
+  } catch (e) {
+    messages.value.push({
+      role: 'assistant',
+      content: `⚠ 生成记忆失败：${e?.message || e}`,
+    })
+    await scrollToBottom()
+  } finally {
+    memoryLoading.value = false
+  }
+}
+
+/** 手动触发长期记忆压缩 → 写入 ai_memory(scope=longterm)，用于测试（日后可由凌晨定时任务调用同一接口） */
+async function compressLongtermMemory() {
+  const uid = authStore.currentUser?.id
+  if (uid == null) return
+  longtermMemoryLoading.value = true
+  try {
+    const res = await fetch(`${API_BASE}/ai/memory/compress-longterm`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user_id: uid }),
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) {
+      const detail = data?.detail || data?.message || data?.error || '请求失败'
+      throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail))
+    }
+    const full = data.content || ''
+    const preview = full.length > 800 ? `${full.slice(0, 800)}…` : full
+    messages.value.push({
+      role: 'assistant',
+      content:
+        `✅ 已压缩并写入长期记忆（scope=longterm，user_id=${data.user_id ?? uid}）。\n\n` +
+        (preview ? `内容预览：\n${preview}` : '（内容为空）'),
+    })
+    await scrollToBottom()
+  } catch (e) {
+    messages.value.push({
+      role: 'assistant',
+      content: `⚠ 长期记忆压缩失败：${e?.message || e}`,
+    })
+    await scrollToBottom()
+  } finally {
+    longtermMemoryLoading.value = false
   }
 }
 
@@ -879,6 +1060,8 @@ async function sendMessage(text) {
           ...cur,
           writePreview: {
             summary: payload.summary || '',
+            expert_explanation: payload.expert_explanation,
+            highlight_words: payload.highlight_words || [],
             payload: payload.payload || null,
           },
         }
@@ -924,7 +1107,6 @@ async function sendMessage(text) {
         files: pendingFiles.value,
         confirm: false,
         stream: true,
-        inviteExpert: inviteExpert.value,
         user_id: authStore.currentUser?.id,
         session_id: chatSessionId.value,
       }),
@@ -966,6 +1148,8 @@ async function sendMessage(text) {
           pendingToken: null,
           writePreview: {
             summary: data.summary || '',
+            expert_explanation: data.expert_explanation ?? data.payload?.expert_explanation,
+            highlight_words: data.highlight_words || [],
             payload: data.payload,
           },
         })
@@ -1001,16 +1185,10 @@ async function sendMessage(text) {
   } catch (e) {
     const aborted = e?.name === 'AbortError' || ac.signal.aborted
     if (aborted) {
-      if (state.assistantIdx >= 0) {
-        const cur = messages.value[state.assistantIdx]
-        const c = (cur?.content || '').trim()
-        messages.value[state.assistantIdx] = {
-          ...cur,
-          content: c ? `${cur.content}\n\n（已停止生成）` : '（已停止生成）',
-        }
-      } else {
-        messages.value.push({ role: 'assistant', content: '（已停止生成）' })
-      }
+      messages.value.push({
+        role: 'system',
+        content: '用户已终止自动执行。',
+      })
     } else {
       const em = e?.message || '请求失败'
       lastErrorMessage.value = String(em)
@@ -1104,6 +1282,8 @@ async function confirmOperation() {
           ...cur,
           writePreview: {
             summary: payload.summary || '',
+            expert_explanation: payload.expert_explanation,
+            highlight_words: payload.highlight_words || [],
             payload: payload.payload || null,
           },
         }
@@ -1177,7 +1357,6 @@ async function confirmOperation() {
       files: [],
       confirm: true,
       stream: true,
-      inviteExpert: inviteExpert.value,
       user_id: authStore.currentUser?.id,
       session_id: chatSessionId.value,
       ...(pendingTok ? { pendingToken: pendingTok } : {}),
@@ -1220,6 +1399,12 @@ async function confirmOperation() {
     const aborted = e?.name === 'AbortError' || ac.signal.aborted
     if (aborted && lastIdx >= 0 && confirmSnapshot) {
       messages.value[lastIdx] = confirmSnapshot
+    }
+    if (aborted) {
+      messages.value.push({
+        role: 'system',
+        content: '用户已终止自动执行。',
+      })
     } else if (!aborted) {
       messages.value.push({
         role: 'assistant',
@@ -1377,6 +1562,12 @@ async function confirmOperation() {
 .message.assistant .msg-body {
   color: var(--text-2);
 }
+.message.system .msg-system-line {
+  font-size: 12px;
+  color: var(--text-3);
+  font-style: italic;
+  padding: 6px 0;
+}
 
 .msg-table-block {
   width: 100%;
@@ -1472,17 +1663,25 @@ async function confirmOperation() {
   border-top: 1px solid var(--border);
   padding: 8px 16px 12px;
 }
-.ai-expert-hint {
+.ai-memory-hint {
   display: flex;
   align-items: center;
   justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 4px 6px;
   margin-bottom: 6px;
   min-height: 18px;
 }
-.ai-expert-label {
+.ai-memory-label {
   font-size: 11px;
   color: var(--text-3);
   letter-spacing: 0.02em;
+}
+.ai-memory-sep {
+  font-size: 11px;
+  color: var(--text-3);
+  opacity: 0.5;
+  user-select: none;
 }
 .ai-input-wrap {
   display: flex;
@@ -1548,7 +1747,7 @@ async function confirmOperation() {
 }
 .plus-btn:disabled { opacity: 0.3; cursor: not-allowed; }
 
-.expert-btn {
+.memory-btn {
   width: 32px;
   height: 32px;
   background: var(--bg-active);
@@ -1563,20 +1762,18 @@ async function confirmOperation() {
   transition: all var(--transition);
   padding: 0;
 }
-.expert-btn:hover:not(:disabled) {
+.memory-btn:hover:not(:disabled) {
   border-color: var(--border-hi);
   color: var(--text-1);
 }
-.expert-btn:disabled {
+.memory-btn:disabled {
   opacity: 0.3;
   cursor: not-allowed;
 }
-.expert-btn-on {
-  border-color: var(--accent);
-  background: rgba(88, 166, 255, 0.12);
-  color: var(--accent);
+.memory-btn-longterm {
+  border-style: dashed;
 }
-.expert-glyph {
+.memory-glyph {
   font-size: 16px;
   line-height: 1;
 }
@@ -1597,12 +1794,42 @@ async function confirmOperation() {
   border-radius: var(--radius, 8px);
   max-width: 100%;
 }
+.msg-write-preview-section {
+  margin-top: 6px;
+}
+.msg-write-preview-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-3);
+  letter-spacing: 0.04em;
+  margin-bottom: 4px;
+}
+.msg-write-preview-label-sub {
+  margin-top: 10px;
+  font-weight: 500;
+}
 .msg-write-preview-body {
   font-size: 13px;
   line-height: 1.6;
   color: var(--text-1);
-  margin: 6px 0 12px;
+  margin: 0 0 8px;
   white-space: pre-wrap;
+}
+.msg-write-preview-expert {
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.msg-write-preview-expert-text {
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-3);
+  white-space: pre-wrap;
+}
+.msg-write-preview-meta {
+  font-size: 11px;
+  color: var(--text-3);
+  margin: -6px 0 12px;
 }
 .msg-write-preview-actions {
   display: flex;

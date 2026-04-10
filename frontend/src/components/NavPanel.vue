@@ -16,6 +16,7 @@
     <div class="nav-quick">
       <router-link to="/dashboard" class="quick-link" active-class="active">仪表盘</router-link>
       <router-link to="/ai-rules" class="quick-link" active-class="active">AI 规则</router-link>
+      <router-link to="/memory" class="quick-link" active-class="active">记忆</router-link>
     </div>
 
     <div class="nav-data-wrap">

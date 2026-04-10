@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import psycopg2.extras
-from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
@@ -27,9 +27,20 @@ from pydantic import BaseModel, ConfigDict, Field
 from psycopg2.extras import Json
 
 from tools.database import close_all_pools, db_conn
-from engine.memory_manager import clean_session, compress_longterm
+from engine.memory_manager import (
+    clean_session,
+    compress_longterm,
+    extract_core_facts,
+    maybe_clean_previous_session,
+)
 from engine.prompt_builder import build_prompt
-from engine.sql_engine import confirm_execute_sql, execute_sql, preview_sql
+from engine.sql_engine import (
+    confirm_batch_sql,
+    execute_sql,
+    highlight_words_from_summary,
+    preview_sql,
+    verify_confirmed_writes,
+)
 from llm.client import (
     chat,
     chat_expert_only,
@@ -46,8 +57,23 @@ if not logger.handlers:
     logger.addHandler(_orch_h)
 logger.propagate = False
 
-MAX_TOOL_ROUNDS = 3
-MAX_EXPERT_STEPS = 5
+# --- 外层 orchestrator（与内层 expert 步数无关，勿混用）---
+# 主助手每轮回复 ↔ 解析 [TOOL] ↔ 调一次 _call_tool_expert（内层另有 MAX_EXPERT_STEPS）的上限。
+MAX_ORCHESTRATOR_ROUNDS = 30
+# 历史名称：与 MAX_ORCHESTRATOR_ROUNDS 同一概念，非 expert 内层步数。
+MAX_TOOL_ROUNDS = MAX_ORCHESTRATOR_ROUNDS
+
+_ORCH_MSG_MAX_ROUNDS = (
+    "任务步骤过多，已暂停。你可以继续对话推进剩余步骤。"
+)
+_ORCH_MSG_DUP_TOOL = "检测到重复操作，已暂停。请检查后继续。"
+_ORCH_SYSTEM_ABORT = "用户已终止自动执行。"
+
+# --- 内层 tool_expert（_run_tool_expert_dialog）---
+# 单次 [TOOL] 调用里 query/write/done 的多轮对话上限；与外层 orchestrator 轮数独立。
+MAX_EXPERT_STEPS = 30
+# 用户确认写入后：执行或校验失败时专家重写 SQL 重试，与上面「专家总步数」无关
+MAX_WRITE_CONFIRM_ATTEMPTS = 3
 
 
 def _extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
@@ -96,6 +122,62 @@ def _extract_tool_block(text: str) -> Optional[Dict[str, str]]:
     return block
 
 
+def _user_visible_stream_prefix(full_reply: str) -> str:
+    """
+    SSE 发给用户可见的文本：不包含 [TOOL] 块内原文，也不包含 [/TOOL] 之后同轮编造内容。
+    若已出现 [TOOL] 但未闭合，只展示 [TOOL] 之前的部分（块内缓冲不下发）。
+    """
+    low = full_reply.lower()
+    ti = low.find("[tool]")
+    if ti < 0:
+        return full_reply
+    end = low.find("[/tool]", ti)
+    if end < 0:
+        return full_reply[:ti]
+    return full_reply[:ti]
+
+
+def _strip_assistant_fabrication_after_tool(full_reply: str) -> str:
+    """
+    写入 ai_chat、并作为下一轮 assistant 消息时，去掉 [/TOOL] 之后的同轮续写，避免把编造带进上下文。
+    """
+    low = full_reply.lower()
+    ti = low.find("[tool]")
+    if ti < 0:
+        return full_reply
+    end = low.find("[/tool]", ti)
+    if end < 0:
+        return full_reply
+    return full_reply[: end + len("[/TOOL]")].rstrip()
+
+
+def _expert_exec_feedback(exec_result: Dict[str, Any]) -> str:
+    """给 tool_expert 的反馈：失败时把 error 放在最前，便于模型纠错。"""
+    body = json.dumps(exec_result, ensure_ascii=False, default=str)
+    if not exec_result.get("success"):
+        err = exec_result.get("error") or "未知错误"
+        return f"执行失败。\n首要错误：{err}\n完整结果（JSON）：\n{body}"
+    return f"执行结果：\n{body}"
+
+
+_EXPERT_LOG_SQL_MAX = 2500
+_EXPERT_LOG_FEEDBACK_MAX = 4000
+_EXPERT_LOG_REPLY_HEAD = 600
+
+# 流式对话：工具执行前提示；写入预览前提示（并记入 ai_chat）
+_SSE_TOOL_PLEASE_WAIT = "\n\n请稍等......\n\n"
+_WRITE_PREVIEW_CONFIRM_HINT = "「确认的内容」请确认。"
+
+
+def _trunc_for_log(s: Optional[str], max_len: int = _EXPERT_LOG_SQL_MAX) -> str:
+    if s is None:
+        return ""
+    t = str(s)
+    if len(t) <= max_len:
+        return t
+    return t[:max_len] + f"...(truncated total_len={len(t)})"
+
+
 def _format_tool_result(tool_block: Dict[str, str], result: Dict[str, Any]) -> str:
     """把 tool_expert 最终结果格式化为 [TOOL_RESULT] 块注入给助手。"""
     action = tool_block.get("action", "")
@@ -111,9 +193,14 @@ def _format_tool_result(tool_block: Dict[str, str], result: Dict[str, Any]) -> s
             lines.append(
                 f"candidates: {c if isinstance(c, str) else json.dumps(c, ensure_ascii=False, default=str)}"
             )
-    elif result.get("sql") and result.get("stage") == "preview":
+    elif result.get("stage") == "preview" and (
+        result.get("sql") or result.get("batch_writes")
+    ):
         lines.append("status: pending_confirm")
         lines.append(f"summary: {result.get('summary', '')}")
+        bw = result.get("batch_writes")
+        if bw:
+            lines.append(f"batch_count: {len(bw)}")
     else:
         lines.append("status: success")
         lines.append(f"summary: {result.get('summary', '')}")
@@ -130,40 +217,100 @@ def _is_write_preview_result(result: Dict[str, Any]) -> bool:
         return False
     if result.get("stage") != "preview":
         return False
+    if result.get("batch_writes"):
+        return len(result["batch_writes"]) > 0
     if not result.get("sql"):
         return False
     op = (result.get("operation") or "").lower()
     return op in ("insert", "update", "delete")
 
 
-async def _call_tool_expert(tool_block: Dict[str, str]) -> Dict[str, Any]:
-    """
-    把助手的意图指令发给 tool_expert；expert 内部多步执行（query / write / done），
-    闭环完成后返回最终结果（摘要、错误或写预览）。
-    """
-    expert_system = build_prompt("tool_expert")
-    user_msg = "\n".join(f"{k}: {v}" for k, v in tool_block.items())
-    logger.info(f"orchestrator: 调用 tool_expert, 发送内容:\n{user_msg}")
-    expert_messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": expert_system},
-        {"role": "user", "content": user_msg},
-    ]
+async def _run_tool_expert_dialog(
+    expert_messages: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """tool_expert 多轮对话：query / write / done，与入口消息无关（由调用方注入）。"""
+    pending_writes: List[Dict[str, Any]] = []
 
     def _run_expert() -> str:
         return chat(expert_messages)
 
     for step in range(MAX_EXPERT_STEPS):
+        logger.info(
+            "tool_expert_detail | step_begin | n=%d/%d | dialog_messages=%d",
+            step + 1,
+            MAX_EXPERT_STEPS,
+            len(expert_messages),
+        )
         logger.info(f"tool_expert: 第 {step + 1}/{MAX_EXPERT_STEPS} 步")
         expert_reply = await asyncio.to_thread(_run_expert)
         logger.info(f"tool_expert: 回复:\n{expert_reply}")
+        logger.info(
+            "tool_expert_detail | model_raw | n=%d | chars=%d | head=%r",
+            step + 1,
+            len(expert_reply or ""),
+            _trunc_for_log(expert_reply, _EXPERT_LOG_REPLY_HEAD),
+        )
 
         payload = _extract_json_from_text(expert_reply)
         if not payload:
             return {"success": False, "error": "工具专家未返回有效指令"}
 
         logger.info(f"orchestrator: expert payload: {payload}")
+        logger.info(
+            "tool_expert_detail | parsed | n=%d | done=%s | type=%s | sql=%s | params=%s | explanation_head=%r",
+            step + 1,
+            payload.get("done"),
+            payload.get("type"),
+            _trunc_for_log((payload.get("sql") or "").strip() or None),
+            payload.get("params"),
+            _trunc_for_log(str(payload.get("explanation") or ""), 200),
+        )
 
         if payload.get("done"):
+            if pending_writes:
+                if not payload.get("success", False):
+                    return {
+                        "success": False,
+                        "error": payload.get("error")
+                        or "存在未确认的写入预览，但 done 未标记成功",
+                    }
+                expert_overall = str(payload.get("summary") or "").strip() or None
+                engine_lines = [
+                    f"{i + 1}) {w.get('summary') or ''}"
+                    for i, w in enumerate(pending_writes)
+                ]
+                overall_engine = "\n".join(engine_lines).strip() or "请确认以下写入操作"
+                batch_out = {
+                    "success": True,
+                    "stage": "preview",
+                    "batch_writes": pending_writes,
+                    "summary": overall_engine,
+                    "expert_explanation": expert_overall,
+                    "highlight_words": highlight_words_from_summary(overall_engine),
+                    "payload": {
+                        "batch": [
+                            {
+                                "sql": w["sql"],
+                                "params": w.get("params") or [],
+                                "table": w.get("table"),
+                                "operation": w.get("operation"),
+                                "expert_explanation": w.get("expert_explanation"),
+                            }
+                            for w in pending_writes
+                        ],
+                        "summary": overall_engine,
+                        "expert_explanation": expert_overall,
+                    },
+                    "operation": "batch",
+                    "sql": pending_writes[0]["sql"],
+                }
+                logger.info(
+                    "tool_expert_detail | done_batch_preview | n=%d | writes=%d | summary_head=%r",
+                    step + 1,
+                    len(pending_writes),
+                    _trunc_for_log(overall_engine, 400),
+                )
+                return batch_out
             out = {
                 "success": bool(payload.get("success", False)),
                 "summary": str(payload.get("summary", "") or ""),
@@ -171,6 +318,14 @@ async def _call_tool_expert(tool_block: Dict[str, str]) -> Dict[str, Any]:
                 "need_info": payload.get("need_info"),
                 "candidates": payload.get("candidates"),
             }
+            logger.info(
+                "tool_expert_detail | done | n=%d | success=%s | summary=%r | error=%r | need_info=%r",
+                step + 1,
+                out.get("success"),
+                _trunc_for_log(str(out.get("summary") or ""), 500),
+                out.get("error"),
+                out.get("need_info"),
+            )
             logger.info(
                 f"orchestrator: engine 执行结果: success={out.get('success')}, keys={list(out.keys())}"
             )
@@ -191,16 +346,43 @@ async def _call_tool_expert(tool_block: Dict[str, str]) -> Dict[str, Any]:
 
             exec_result = await asyncio.to_thread(_do_query)
             logger.info(
-                f"tool_expert: query 结果: success={exec_result.get('success')}, count={exec_result.get('count')}"
+                "tool_expert: query 结果: success=%s, count=%s, error=%r",
+                exec_result.get("success"),
+                exec_result.get("count"),
+                exec_result.get("error"),
             )
             logger.info(
-                f"orchestrator: engine 执行结果: success={exec_result.get('success')}, keys={list(exec_result.keys())}"
+                "orchestrator: engine 执行结果: success=%s, keys=%s, error=%r",
+                exec_result.get("success"),
+                list(exec_result.keys()),
+                exec_result.get("error"),
             )
-            result_text = json.dumps(exec_result, ensure_ascii=False, default=str)
+            rows = exec_result.get("rows")
+            row_preview = ""
+            if isinstance(rows, list) and rows:
+                try:
+                    row_preview = _trunc_for_log(
+                        json.dumps(rows[:3], ensure_ascii=False, default=str), 1200
+                    )
+                except Exception:
+                    row_preview = "(rows preview failed)"
+            logger.info(
+                "tool_expert_detail | engine_query | n=%d | success=%s | count=%s | error=%r | rows_preview=%s",
+                step + 1,
+                exec_result.get("success"),
+                exec_result.get("count"),
+                exec_result.get("error"),
+                row_preview or None,
+            )
+            fb = _expert_exec_feedback(exec_result)
+            logger.info(
+                "tool_expert_detail | feedback_to_expert | n=%d | chars=%d | body=%r",
+                step + 1,
+                len(fb),
+                _trunc_for_log(fb, _EXPERT_LOG_FEEDBACK_MAX),
+            )
             expert_messages.append({"role": "assistant", "content": expert_reply})
-            expert_messages.append(
-                {"role": "user", "content": f"执行结果：\n{result_text}"}
-            )
+            expert_messages.append({"role": "user", "content": fb})
             continue
 
         if cmd_type == "write":
@@ -214,26 +396,163 @@ async def _call_tool_expert(tool_block: Dict[str, str]) -> Dict[str, Any]:
 
             exec_result = await asyncio.to_thread(_do_preview)
             logger.info(
-                f"tool_expert: write preview 结果: success={exec_result.get('success')}"
+                "tool_expert: write preview 结果: success=%s, error=%r",
+                exec_result.get("success"),
+                exec_result.get("error"),
             )
             logger.info(
-                f"orchestrator: engine 执行结果: success={exec_result.get('success')}, keys={list(exec_result.keys())}"
+                "orchestrator: engine 执行结果: success=%s, keys=%s, error=%r",
+                exec_result.get("success"),
+                list(exec_result.keys()),
+                exec_result.get("error"),
+            )
+            logger.info(
+                "tool_expert_detail | engine_write_preview | n=%d | success=%s | table=%s | error=%r | sql=%s",
+                step + 1,
+                exec_result.get("success"),
+                exec_result.get("table"),
+                exec_result.get("error"),
+                _trunc_for_log(sql),
             )
             if exec_result.get("success"):
-                if explanation:
-                    exec_result["summary"] = explanation
-                return exec_result
+                exp = explanation.strip()
+                if exp:
+                    exec_result["expert_explanation"] = exp
+                pending_writes.append(
+                    {
+                        "sql": sql,
+                        "params": params_list,
+                        "table": exec_result.get("table"),
+                        "operation": exec_result.get("operation"),
+                        "summary": exec_result.get("summary"),
+                        "expert_explanation": exp or None,
+                    }
+                )
+                staged = len(pending_writes)
+                # 仅一条写入时直接进入待确认（减少一轮「done」LLM）；多条时需再输出 done + 总述
+                if staged == 1:
+                    overall = pending_writes[0].get("summary") or "请确认以下写入"
+                    overall_expert = pending_writes[0].get("expert_explanation") or None
+                    logger.info(
+                        "tool_expert_detail | auto_finalize_single_write | n=%d",
+                        step + 1,
+                    )
+                    return {
+                        "success": True,
+                        "stage": "preview",
+                        "batch_writes": list(pending_writes),
+                        "summary": overall,
+                        "expert_explanation": overall_expert,
+                        "highlight_words": highlight_words_from_summary(overall),
+                        "payload": {
+                            "batch": [
+                                {
+                                    "sql": w["sql"],
+                                    "params": w.get("params") or [],
+                                    "table": w.get("table"),
+                                    "operation": w.get("operation"),
+                                    "expert_explanation": w.get("expert_explanation"),
+                                }
+                                for w in pending_writes
+                            ],
+                            "summary": overall,
+                            "expert_explanation": overall_expert,
+                        },
+                        "operation": "batch",
+                        "sql": pending_writes[0]["sql"],
+                    }
+                fb = (
+                    f"已暂存第 {staged} 条写入预览（已通过审计，尚未执行）。\n"
+                    f"{_expert_exec_feedback(exec_result)}\n\n"
+                    "若还有写入，请继续输出一条 type 为 write 的 JSON；"
+                    "若全部写入已规划完毕，请输出：\n"
+                    '{"done": true, "success": true, "summary": "给用户看的整体说明（汇总将执行哪些写入）"}'
+                )
+                logger.info(
+                    "tool_expert_detail | write_staged | n=%d | staged_total=%d",
+                    step + 1,
+                    staged,
+                )
+                expert_messages.append({"role": "assistant", "content": expert_reply})
+                expert_messages.append({"role": "user", "content": fb})
+                continue
 
-            fail_text = json.dumps(exec_result, ensure_ascii=False, default=str)
-            expert_messages.append({"role": "assistant", "content": expert_reply})
-            expert_messages.append(
-                {"role": "user", "content": f"执行结果：\n{fail_text}"}
+            fb = _expert_exec_feedback(exec_result)
+            logger.info(
+                "tool_expert_detail | feedback_to_expert | n=%d | chars=%d | body=%r",
+                step + 1,
+                len(fb),
+                _trunc_for_log(fb, _EXPERT_LOG_FEEDBACK_MAX),
             )
+            expert_messages.append({"role": "assistant", "content": expert_reply})
+            expert_messages.append({"role": "user", "content": fb})
             continue
 
         return {"success": False, "error": f"未知指令类型: {cmd_type}"}
 
+    if pending_writes:
+        return {
+            "success": False,
+            "error": f"已达最大步数（{MAX_EXPERT_STEPS}），仍有 {len(pending_writes)} 条写入待汇总；请输出 done 并附 summary，或拆分任务",
+            "pending_staged": len(pending_writes),
+        }
     return {"success": False, "error": "操作步骤过多，未能完成"}
+
+
+async def _call_tool_expert(tool_block: Dict[str, str]) -> Dict[str, Any]:
+    """
+    把助手的意图指令发给 tool_expert；expert 内部多步执行（query / write / done），
+    闭环完成后返回最终结果（摘要、错误或写预览）。
+    """
+    expert_system = build_prompt("tool_expert")
+    user_msg = "\n".join(f"{k}: {v}" for k, v in tool_block.items())
+    logger.info(f"orchestrator: 调用 tool_expert, 发送内容:\n{user_msg}")
+    expert_messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": expert_system},
+        {"role": "user", "content": user_msg},
+    ]
+    logger.info(
+        "tool_expert_detail | start | max_steps=%d | intent_keys=%s",
+        MAX_EXPERT_STEPS,
+        list(tool_block.keys()),
+    )
+    return await _run_tool_expert_dialog(expert_messages)
+
+
+async def _call_tool_expert_recover_after_failed_confirm(
+    failure_reason: str,
+    failed_batch: List[Dict[str, Any]],
+    last_confirm: Optional[Dict[str, Any]],
+    tool_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """用户已点确认后执行或校验失败：由专家重写 batch（服务端自动再执行，无需用户再点预览）。"""
+    expert_system = build_prompt("tool_expert")
+    payload: Dict[str, Any] = {
+        "phase": "recover_after_user_confirm",
+        "说明": (
+            "用户已确认过预览，但数据库执行或执行后校验未通过。"
+            "请根据错误信息修正 SQL，重新输出 write（可多条），并以 done+summary 结束；"
+            "仅一条 write 时可直接形成新预览。"
+            "若「原始助手意图」中要求合同行项目/数量/产品，必须一并写入 contract_items，不可只写 contracts 主表。"
+        ),
+        "错误与校验信息": failure_reason,
+        "此前待执行的 batch": failed_batch,
+    }
+    if tool_context:
+        payload["原始助手意图_TOOL块"] = tool_context
+    if last_confirm is not None:
+        payload["上次执行引擎返回"] = last_confirm
+    user_msg = json.dumps(payload, ensure_ascii=False, default=str)
+    expert_messages = [
+        {"role": "system", "content": expert_system},
+        {"role": "user", "content": user_msg},
+    ]
+    logger.info(
+        "tool_expert_recover | start | batch_len=%d | reason_head=%r",
+        len(failed_batch),
+        _trunc_for_log(failure_reason, 300),
+    )
+    return await _run_tool_expert_dialog(expert_messages)
 
 
 def _insert_ai_chat_row(session_id: int, role: str, content: str) -> None:
@@ -1047,9 +1366,20 @@ class ChatMessage(BaseModel):
 class WriteConfirmRequest(BaseModel):
     """确认执行 write：传入 preview 返回的 payload；兼容旧字段 frame_id（已停用）。"""
 
+    model_config = ConfigDict(populate_by_name=True)
+
     payload: Optional[Dict[str, Any]] = None
     frame_id: Optional[int] = None
     confirmed: Optional[bool] = None
+    session_id: Optional[int] = None
+
+
+class ChatLogMessageRequest(BaseModel):
+    """将一条对话记入 ai_chat（用于前端取消/异常等仅客户端发生的收尾文案）。"""
+
+    session_id: int
+    content: str
+    role: str = "assistant"
 
 
 class ChatRequest(BaseModel):
@@ -1066,13 +1396,245 @@ class ChatRequest(BaseModel):
     user_id: Optional[int] = None
 
 
+def _validate_write_payload_to_batch(pl: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """将前端 payload 规范为 confirm_batch_sql 使用的 batch。"""
+    raw = pl.get("batch")
+    if isinstance(raw, list) and len(raw) > 0:
+        out: List[Dict[str, Any]] = []
+        for i, item in enumerate(raw):
+            if not isinstance(item, dict):
+                raise HTTPException(status_code=400, detail=f"batch[{i}] 须为对象")
+            if not (item.get("sql") or "").strip():
+                raise HTTPException(status_code=400, detail=f"batch[{i}] 缺少 sql")
+            if not isinstance(item.get("params", []), list):
+                raise HTTPException(status_code=400, detail=f"batch[{i}].params 必须为数组")
+            out.append(
+                {
+                    "sql": (item.get("sql") or "").strip(),
+                    "params": list(item.get("params") or []),
+                }
+            )
+        return out
+    sql = pl.get("sql")
+    params = pl.get("params", [])
+    if not sql or not isinstance(sql, str):
+        raise HTTPException(status_code=400, detail="缺少 sql 或 batch")
+    if not isinstance(params, list):
+        raise HTTPException(status_code=400, detail="params 必须为数组")
+    if not sql.strip():
+        raise HTTPException(status_code=400, detail="缺少 sql")
+    return [{"sql": sql.strip(), "params": params}]
+
+
+def _merge_tool_context_into_payload(
+    payload: Any,
+    tool_block: Dict[str, str],
+) -> Dict[str, Any]:
+    """预览 payload 附带原始 [TOOL] 意图，供 /ai/confirm 失败时专家恢复引用（避免只修主表丢掉子表）。"""
+    if isinstance(payload, dict):
+        base = dict(payload)
+    else:
+        base = {}
+    base["tool_context"] = dict(tool_block)
+    return base
+
+
+def verify_batch_matches_tool_intent(
+    batch: List[Dict[str, Any]],
+    tool_context: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    执行前检查：若意图明确包含合同行项目，则 batch 须出现 contract_items 相关写入。
+    避免主表 INSERT 已成功、子表从未生成却显示「完成任务」。
+    """
+    if not tool_context or not isinstance(tool_context, dict):
+        return {"ok": True, "reason": ""}
+    details = str(tool_context.get("details") or "")
+    action = str(tool_context.get("action") or "").lower()
+    intent = str(tool_context.get("intent") or "")
+    blob = f"{action} {intent} {details}"
+    if "合同" not in blob and "contract" not in blob.lower():
+        return {"ok": True, "reason": ""}
+    line_hints = ("数量", "米", "产品", "单价", "金额", "明细", "行项目")
+    if not any(h in details for h in line_hints):
+        return {"ok": True, "reason": ""}
+    sql_joined = " ".join((x.get("sql") or "").lower() for x in batch)
+    if "contract_items" in sql_joined:
+        return {"ok": True, "reason": ""}
+    return {
+        "ok": False,
+        "reason": (
+            "意图（details）包含合同行项目信息，但当前待执行 SQL 未写入 business.contract_items；"
+            "请生成含主表与子表的完整 batch（可用 CTE 多语句或顺序 INSERT）。"
+        ),
+    }
+
+
+def _batch_from_write_preview(expert_out: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    """从专家返回的预览结果中提取可执行的 batch。"""
+    if not _is_write_preview_result(expert_out):
+        return None
+    pl = expert_out.get("payload") if isinstance(expert_out.get("payload"), dict) else {}
+    raw = pl.get("batch")
+    if not isinstance(raw, list) or len(raw) == 0:
+        return None
+    out: List[Dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            return None
+        s = (item.get("sql") or "").strip()
+        if not s:
+            return None
+        out.append({"sql": s, "params": list(item.get("params") or [])})
+    return out
+
+
+async def _confirm_writes_with_verify_and_recovery(
+    batch: List[Dict[str, Any]],
+    tool_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """执行前意图检查 → 执行 → 校验；失败则调用专家重写 SQL，最多共 MAX_WRITE_CONFIRM_ATTEMPTS 次执行尝试。"""
+    current: List[Dict[str, Any]] = [dict(x) for x in batch]
+    recovery_rounds = 0
+
+    for attempt in range(MAX_WRITE_CONFIRM_ATTEMPTS):
+        intent_chk = verify_batch_matches_tool_intent(current, tool_context)
+        if not intent_chk.get("ok"):
+            failure_reason = intent_chk.get("reason") or "与原始意图不一致"
+            if attempt >= MAX_WRITE_CONFIRM_ATTEMPTS - 1:
+                return {
+                    "success": False,
+                    "error": (
+                        f"任务失败：已尝试 {MAX_WRITE_CONFIRM_ATTEMPTS} 次仍未满足意图校验。"
+                        f"最后原因：{failure_reason}"
+                    ),
+                    "task_failed": True,
+                    "recovery_rounds": recovery_rounds,
+                    "last_error": failure_reason,
+                }
+            expert_out = await _call_tool_expert_recover_after_failed_confirm(
+                failure_reason,
+                current,
+                None,
+                tool_context,
+            )
+            new_batch = _batch_from_write_preview(expert_out)
+            if not new_batch:
+                err = expert_out.get("error") or "专家未返回可执行的写入预览"
+                return {
+                    "success": False,
+                    "error": f"任务失败：{err}",
+                    "task_failed": True,
+                    "recovery_rounds": recovery_rounds,
+                    "last_error": err,
+                }
+            current = new_batch
+            recovery_rounds += 1
+            continue
+
+        def _run_one() -> Dict[str, Any]:
+            with db_conn() as conn:
+                try:
+                    return confirm_batch_sql(current, conn)
+                except Exception as e:
+                    logger.exception("ai/confirm confirm_batch_sql: %s", e)
+                    return {"success": False, "error": f"执行异常：{e}"}
+
+        confirm_result = await asyncio.to_thread(_run_one)
+
+        if confirm_result.get("success"):
+            v = verify_confirmed_writes(current, confirm_result)
+            if v.get("ok"):
+                msg = "已经按照您的要求完成任务。"
+                if recovery_rounds:
+                    msg += f"（经 {recovery_rounds} 轮专家自动修正）"
+                return {
+                    "success": True,
+                    "results": confirm_result.get("results"),
+                    "count": confirm_result.get("count"),
+                    "verify_message": msg,
+                    "verify_ok": True,
+                    "recovery_rounds": recovery_rounds,
+                }
+            failure_reason = v.get("reason") or "执行后校验未通过"
+        else:
+            failure_reason = confirm_result.get("error") or "执行失败"
+
+        if attempt >= MAX_WRITE_CONFIRM_ATTEMPTS - 1:
+            return {
+                "success": False,
+                "error": (
+                    f"任务失败：已尝试 {MAX_WRITE_CONFIRM_ATTEMPTS} 次执行仍未成功。"
+                    f"最后原因：{failure_reason}"
+                ),
+                "task_failed": True,
+                "recovery_rounds": recovery_rounds,
+                "last_error": failure_reason,
+            }
+
+        expert_out = await _call_tool_expert_recover_after_failed_confirm(
+            failure_reason,
+            current,
+            confirm_result,
+            tool_context,
+        )
+        new_batch = _batch_from_write_preview(expert_out)
+        if not new_batch:
+            err = expert_out.get("error") or "专家未返回可执行的写入预览"
+            return {
+                "success": False,
+                "error": f"任务失败：{err}",
+                "task_failed": True,
+                "recovery_rounds": recovery_rounds,
+                "last_error": err,
+            }
+        current = new_batch
+        recovery_rounds += 1
+
+    return {
+        "success": False,
+        "error": "任务失败：未预期结束",
+        "task_failed": True,
+        "recovery_rounds": recovery_rounds,
+    }
+
+
 def _sse_line(obj: Dict[str, Any]) -> bytes:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
+def _assistant_line_from_write_confirm_result(r: Dict[str, Any]) -> str:
+    """与 AiPanel 展示一致，用于写入 ai_chat。"""
+    if r.get("success"):
+        vm = str(r.get("verify_message") or "").strip()
+        if vm:
+            return f"✅ {vm}"
+        return "✅ 已经按照您的要求完成任务。"
+    if r.get("task_failed"):
+        return f"❌ {r.get('error') or '任务失败'}"
+    return f"❌ 执行失败：{r.get('error') or '未知错误'}"
+
+
+@app.post("/ai/chat/log-message")
+async def ai_chat_log_message(body: ChatLogMessageRequest):
+    """将一条消息追加写入 business.ai_chat（如取消写入、前端捕获的确认异常）。"""
+    content = (body.content or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="content 不能为空")
+    role = (body.role or "assistant").strip().lower()
+    if role not in ("assistant", "user", "tool", "system"):
+        raise HTTPException(status_code=400, detail="role 无效")
+    try:
+        _insert_ai_chat_row(body.session_id, role, content)
+    except Exception as e:
+        logger.exception("ai/chat/log-message: %s", e)
+        raise HTTPException(status_code=500, detail="写入失败") from e
+    return {"ok": True}
+
+
 @app.post("/ai/confirm")
 async def ai_confirm(body: WriteConfirmRequest):
-    """执行经 preview_sql 审核过的写操作 SQL（payload 含 sql、params）。"""
+    """执行经 preview_sql 审核过的写操作；执行后校验，失败则专家自动修正并重试（最多 MAX_WRITE_CONFIRM_ATTEMPTS 次）。"""
 
     if body.payload is not None:
         pass
@@ -1084,22 +1646,18 @@ async def ai_confirm(body: WriteConfirmRequest):
     else:
         raise HTTPException(status_code=400, detail="缺少 payload")
 
-    sql = body.payload.get("sql") if isinstance(body.payload, dict) else None
-    params = body.payload.get("params", []) if isinstance(body.payload, dict) else []
-    if not sql or not isinstance(sql, str):
-        raise HTTPException(status_code=400, detail="缺少 sql")
-    if not isinstance(params, list):
-        raise HTTPException(status_code=400, detail="params 必须为数组")
-
-    def _run() -> Dict[str, Any]:
-        with db_conn() as conn:
-            try:
-                return confirm_execute_sql(sql, params, conn)
-            except Exception as e:
-                logger.exception("ai/confirm confirm_execute_sql: %s", e)
-                return {"success": False, "error": f"执行异常：{e}"}
-
-    return await asyncio.to_thread(_run)
+    pl = body.payload if isinstance(body.payload, dict) else {}
+    batch = _validate_write_payload_to_batch(pl)
+    tc = pl.get("tool_context")
+    tool_context = tc if isinstance(tc, dict) else None
+    result = await _confirm_writes_with_verify_and_recovery(batch, tool_context)
+    sid = body.session_id
+    if sid is not None:
+        try:
+            _insert_ai_chat_row(sid, "assistant", _assistant_line_from_write_confirm_result(result))
+        except Exception as e:
+            logger.warning("ai/confirm: 写入 ai_chat 收尾失败 session_id=%s err=%s", sid, e)
+    return result
 
 
 @app.post("/ai/memory/clean-session")
@@ -1134,6 +1692,126 @@ async def api_compress_longterm(body: Dict[str, Any] = Body(...)):
     return result
 
 
+@app.post("/ai/memory/extract-core")
+async def api_extract_core(body: Dict[str, Any] = Body(...)):
+    """手动触发：从长期记忆提炼核心经验（scope=core）。"""
+    raw = body.get("user_id")
+    if raw is None:
+        raise HTTPException(status_code=400, detail="需要 user_id")
+    try:
+        user_id = int(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="user_id 必须为整数")
+    result = await asyncio.to_thread(extract_core_facts, user_id)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "提炼失败"))
+    return result
+
+
+@app.get("/ai/memory")
+def list_ai_memory(
+    user_id: int = Query(..., description="员工用户 id"),
+    scope: str = Query(..., description="core 或 longterm"),
+):
+    """列出指定用户、指定 scope 的记忆行（不含 session）。"""
+    if scope not in ("core", "longterm"):
+        raise HTTPException(
+            status_code=400, detail="scope 须为 core 或 longterm"
+        )
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, user_id, scope, content, created_at, updated_at
+                FROM business.ai_memory
+                WHERE user_id = %s AND scope = %s
+                ORDER BY id ASC
+                """,
+                (user_id, scope),
+            )
+            rows = cur.fetchall()
+    return {"items": [dict(r) for r in rows]}
+
+
+class MemoryCreateBody(BaseModel):
+    user_id: int
+    scope: str
+    content: str
+
+
+@app.post("/ai/memory")
+def create_ai_memory(body: MemoryCreateBody):
+    if body.scope not in ("core", "longterm"):
+        raise HTTPException(
+            status_code=400, detail="scope 须为 core 或 longterm"
+        )
+    c = (body.content or "").strip()
+    if not c:
+        raise HTTPException(status_code=400, detail="content 不能为空")
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO business.ai_memory (user_id, scope, content)
+                VALUES (%s, %s, %s)
+                RETURNING id, user_id, scope, content, created_at, updated_at
+                """,
+                (body.user_id, body.scope, c),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    return dict(row) if row else {}
+
+
+class MemoryPatchBody(BaseModel):
+    content: str
+    user_id: int
+
+
+@app.patch("/ai/memory/{memory_id}")
+def patch_ai_memory(memory_id: int, body: MemoryPatchBody):
+    c = (body.content or "").strip()
+    if not c:
+        raise HTTPException(status_code=400, detail="content 不能为空")
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                UPDATE business.ai_memory
+                SET content = %s, updated_at = NOW()
+                WHERE id = %s AND user_id = %s AND scope IN ('core', 'longterm')
+                RETURNING id, user_id, scope, content, created_at, updated_at
+                """,
+                (c, memory_id, body.user_id),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    if not row:
+        raise HTTPException(status_code=404, detail="记录不存在或无权限")
+    return dict(row)
+
+
+@app.delete("/ai/memory/{memory_id}")
+def delete_ai_memory(
+    memory_id: int,
+    user_id: int = Query(..., description="须与记录 user_id 一致"),
+):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM business.ai_memory
+                WHERE id = %s AND user_id = %s AND scope IN ('core', 'longterm')
+                """,
+                (memory_id, user_id),
+            )
+            n = cur.rowcount
+        conn.commit()
+    if not n:
+        raise HTTPException(status_code=404, detail="记录不存在或无权限")
+    return {"ok": True, "id": memory_id}
+
+
 def _chunk_text_for_sse(text: str, size: int = 48) -> List[str]:
     if not text:
         return [""]
@@ -1148,7 +1826,7 @@ def _last_user_message_text(messages: List[ChatMessage]) -> str:
 
 
 @app.post("/ai/chat")
-async def ai_chat(req: ChatRequest):
+async def ai_chat(req: ChatRequest, request: Request):
     if req.pending_token:
         raise HTTPException(
             status_code=400,
@@ -1195,6 +1873,23 @@ async def ai_chat(req: ChatRequest):
                             m["content"] = (m.get("content") or "") + "\n\n【附件】\n" + extra
                             break
 
+    if user_id is not None and session_id is not None:
+        mem_auto = await asyncio.to_thread(
+            maybe_clean_previous_session, user_id, session_id
+        )
+        if mem_auto.get("auto_cleaned"):
+            logger.info(
+                "memory: 已自动整理上一会话并写入 ai_memory | user_id=%s previous_session_id=%s",
+                user_id,
+                mem_auto.get("previous_session_id"),
+            )
+        elif mem_auto.get("error"):
+            logger.warning(
+                "memory: 自动整理上一会话失败 | user_id=%s err=%s",
+                user_id,
+                mem_auto.get("error"),
+            )
+
     system_prompt = build_prompt("assistant", user_id=user_id)
     api_messages: List[Dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
@@ -1224,27 +1919,68 @@ async def ai_chat(req: ChatRequest):
                 if user_id is not None and session_id is not None:
                     _insert_ai_chat_row(session_id, "user", user_msg_for_log)
 
-                for _round in range(MAX_TOOL_ROUNDS):
+                recent_tool_blocks: List[tuple[str, str]] = []
+
+                for _round in range(MAX_ORCHESTRATOR_ROUNDS):
+                    if await request.is_disconnected():
+                        if user_id is not None and session_id is not None:
+                            _insert_ai_chat_row(
+                                session_id, "system", _ORCH_SYSTEM_ABORT
+                            )
+                        break
                     logger.info(
-                        f"orchestrator: 进入第 {_round + 1}/{MAX_TOOL_ROUNDS} 轮"
+                        "orchestrator: 进入第 %d/%d 轮",
+                        _round + 1,
+                        MAX_ORCHESTRATOR_ROUNDS,
                     )
                     full_reply = ""
+                    last_vis_len = 0
                     if use_expert:
                         full_reply = await asyncio.to_thread(chat_expert_only, work_msgs)
-                        for part in _chunk_text_for_sse(full_reply):
+                        vis = _user_visible_stream_prefix(full_reply)
+                        for part in _chunk_text_for_sse(vis):
                             yield _sse_line({"type": "delta", "text": part})
                     else:
                         async for piece in chat_stream(work_msgs):
                             if piece:
                                 full_reply += piece
-                                yield _sse_line({"type": "delta", "text": piece})
+                                vis = _user_visible_stream_prefix(full_reply)
+                                if len(vis) > last_vis_len:
+                                    yield _sse_line(
+                                        {"type": "delta", "text": vis[last_vis_len:]}
+                                    )
+                                    last_vis_len = len(vis)
 
+                    logged_reply = _strip_assistant_fabrication_after_tool(full_reply)
+                    assistant_user_visible = _user_visible_stream_prefix(full_reply).rstrip()
                     if user_id is not None and session_id is not None:
-                        _insert_ai_chat_row(session_id, "assistant", full_reply)
+                        _insert_ai_chat_row(session_id, "assistant", assistant_user_visible)
 
                     tool_block = _extract_tool_block(full_reply)
                     if not tool_block:
                         break
+
+                    current_ai = (
+                        (tool_block.get("action") or "").strip(),
+                        (tool_block.get("intent") or "").strip(),
+                    )
+                    recent_tool_blocks.append(current_ai)
+                    if len(recent_tool_blocks) >= 3:
+                        t3 = recent_tool_blocks[-3:]
+                        if t3[0] == t3[1] == t3[2]:
+                            yield _sse_line(
+                                {
+                                    "type": "delta",
+                                    "text": f"\n\n{_ORCH_MSG_DUP_TOOL}\n\n",
+                                }
+                            )
+                            if user_id is not None and session_id is not None:
+                                _insert_ai_chat_row(
+                                    session_id, "assistant", _ORCH_MSG_DUP_TOOL
+                                )
+                            break
+
+                    yield _sse_line({"type": "delta", "text": _SSE_TOOL_PLEASE_WAIT})
 
                     result = await _call_tool_expert(tool_block)
 
@@ -1254,14 +1990,30 @@ async def ai_chat(req: ChatRequest):
                             _insert_ai_chat_row(session_id, "tool", result_text)
                         yield _sse_line(
                             {
+                                "type": "delta",
+                                "text": f"\n\n{_WRITE_PREVIEW_CONFIRM_HINT}\n\n",
+                            }
+                        )
+                        if user_id is not None and session_id is not None:
+                            _insert_ai_chat_row(
+                                session_id, "assistant", _WRITE_PREVIEW_CONFIRM_HINT
+                            )
+                        payload_wp = result.get("payload") or {
+                            "sql": result.get("sql"),
+                            "params": result.get("params") or [],
+                        }
+                        if isinstance(payload_wp, dict):
+                            payload_wp = _merge_tool_context_into_payload(
+                                payload_wp, tool_block
+                            )
+                        yield _sse_line(
+                            {
                                 "type": "write_preview",
                                 "stage": result.get("stage"),
                                 "summary": result.get("summary"),
-                                "payload": result.get("payload")
-                                or {
-                                    "sql": result.get("sql"),
-                                    "params": result.get("params") or [],
-                                },
+                                "expert_explanation": result.get("expert_explanation"),
+                                "highlight_words": result.get("highlight_words") or [],
+                                "payload": payload_wp,
                                 "operation": result.get("operation"),
                                 "table": result.get("table"),
                             }
@@ -1272,8 +2024,20 @@ async def ai_chat(req: ChatRequest):
                     if user_id is not None and session_id is not None:
                         _insert_ai_chat_row(session_id, "tool", result_text)
 
-                    work_msgs.append({"role": "assistant", "content": full_reply})
+                    work_msgs.append({"role": "assistant", "content": logged_reply})
                     work_msgs.append({"role": "user", "content": result_text})
+
+                else:
+                    yield _sse_line(
+                        {
+                            "type": "delta",
+                            "text": f"\n\n{_ORCH_MSG_MAX_ROUNDS}\n\n",
+                        }
+                    )
+                    if user_id is not None and session_id is not None:
+                        _insert_ai_chat_row(
+                            session_id, "assistant", _ORCH_MSG_MAX_ROUNDS
+                        )
 
                 yield _sse_line(
                     {
@@ -1299,26 +2063,54 @@ async def ai_chat(req: ChatRequest):
     # ── 非流式 JSON ─────────────────────────────────────────────────
     work_msgs = list(api_messages)
     pr: Optional[Dict[str, Any]] = None
+    pr_tool_block: Optional[Dict[str, str]] = None
     reply = ""
 
     try:
         if user_id is not None and session_id is not None:
             _insert_ai_chat_row(session_id, "user", user_msg_for_log)
 
-        for _round in range(MAX_TOOL_ROUNDS):
-            logger.info(f"orchestrator: 进入第 {_round + 1}/{MAX_TOOL_ROUNDS} 轮")
+        recent_tool_blocks_ns: List[tuple[str, str]] = []
+
+        for _round in range(MAX_ORCHESTRATOR_ROUNDS):
+            if await request.is_disconnected():
+                if user_id is not None and session_id is not None:
+                    _insert_ai_chat_row(session_id, "system", _ORCH_SYSTEM_ABORT)
+                break
+            logger.info(
+                "orchestrator: 进入第 %d/%d 轮",
+                _round + 1,
+                MAX_ORCHESTRATOR_ROUNDS,
+            )
             if use_expert:
                 full_reply = await asyncio.to_thread(chat_expert_only, work_msgs)
             else:
                 full_reply = await asyncio.to_thread(chat, work_msgs)
 
+            logged_reply = _strip_assistant_fabrication_after_tool(full_reply)
+            assistant_user_visible = _user_visible_stream_prefix(full_reply).rstrip()
             if user_id is not None and session_id is not None:
-                _insert_ai_chat_row(session_id, "assistant", full_reply)
+                _insert_ai_chat_row(session_id, "assistant", assistant_user_visible)
 
-            reply = full_reply
+            reply = assistant_user_visible
             tool_block = _extract_tool_block(full_reply)
             if not tool_block:
                 break
+
+            cur_ai = (
+                (tool_block.get("action") or "").strip(),
+                (tool_block.get("intent") or "").strip(),
+            )
+            recent_tool_blocks_ns.append(cur_ai)
+            if len(recent_tool_blocks_ns) >= 3:
+                t3 = recent_tool_blocks_ns[-3:]
+                if t3[0] == t3[1] == t3[2]:
+                    reply = assistant_user_visible + "\n\n" + _ORCH_MSG_DUP_TOOL
+                    if user_id is not None and session_id is not None:
+                        _insert_ai_chat_row(
+                            session_id, "assistant", _ORCH_MSG_DUP_TOOL
+                        )
+                    break
 
             result = await _call_tool_expert(tool_block)
 
@@ -1326,15 +2118,27 @@ async def ai_chat(req: ChatRequest):
                 result_text = _format_tool_result(tool_block, result)
                 if user_id is not None and session_id is not None:
                     _insert_ai_chat_row(session_id, "tool", result_text)
+                    _insert_ai_chat_row(session_id, "assistant", _WRITE_PREVIEW_CONFIRM_HINT)
+                reply = (
+                    assistant_user_visible
+                    + _SSE_TOOL_PLEASE_WAIT
+                    + _WRITE_PREVIEW_CONFIRM_HINT
+                )
                 pr = result
+                pr_tool_block = tool_block
                 break
 
             result_text = _format_tool_result(tool_block, result)
             if user_id is not None and session_id is not None:
                 _insert_ai_chat_row(session_id, "tool", result_text)
 
-            work_msgs.append({"role": "assistant", "content": full_reply})
+            work_msgs.append({"role": "assistant", "content": logged_reply})
             work_msgs.append({"role": "user", "content": result_text})
+        else:
+            sep = "\n\n" if reply else ""
+            reply = (reply or "") + sep + _ORCH_MSG_MAX_ROUNDS
+            if user_id is not None and session_id is not None:
+                _insert_ai_chat_row(session_id, "assistant", _ORCH_MSG_MAX_ROUNDS)
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
 
@@ -1353,10 +2157,16 @@ async def ai_chat(req: ChatRequest):
     if pr and pr.get("success"):
         out["stage"] = "preview"
         out["summary"] = pr.get("summary")
-        out["payload"] = pr.get("payload") or {
+        out["expert_explanation"] = pr.get("expert_explanation")
+        out["highlight_words"] = pr.get("highlight_words") or []
+        base_pl = pr.get("payload") or {
             "sql": pr.get("sql"),
             "params": pr.get("params") or [],
         }
+        if isinstance(base_pl, dict) and pr_tool_block:
+            out["payload"] = _merge_tool_context_into_payload(base_pl, pr_tool_block)
+        else:
+            out["payload"] = base_pl
         out["operation"] = pr.get("operation")
         out["table"] = pr.get("table")
     return out
