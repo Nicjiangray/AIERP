@@ -128,7 +128,7 @@ export const useAppStore = defineStore('app', () => {
   async function fetchTableData(schema, table, limit = 100, opts = {}) {
     const { filters, q, offset, sortBy, sortOrder } = opts
     try {
-      const u = new URL(`${API}/table/${schema}/${table}`)
+      const u = new URL(`/table/${schema}/${table}`, window.location.origin)
       u.searchParams.set('limit', String(limit))
       if (offset != null && offset > 0)
         u.searchParams.set('offset', String(offset))
