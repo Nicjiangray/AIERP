@@ -2,8 +2,9 @@ venv/
 .venv/
 __pycache__/
 .env
-# 其它环境/密钥副本（勿提交）
-.env.*
+# 本地覆盖与密钥（勿提交）；允许提交 frontend/.env.development、.env.production
+.env.local
+.env.*.local
 .cursor*.log
 .cursor*.txt
 node_modules/

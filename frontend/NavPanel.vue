@@ -39,14 +39,15 @@
 
 <script setup>
 import { computed, onMounted, ref } from 'vue'
-import { useAppStore } from '../stores/app'
+import { apiHealthCheckUrl } from './src/config/api.js'
+import { useAppStore } from './src/stores/app.js'
 
 const store = useAppStore()
 const apiOk = ref(false)
 
 onMounted(async () => {
   try {
-    const res = await fetch('/')
+    const res = await fetch(apiHealthCheckUrl())
     apiOk.value = res.ok
     await store.fetchTables()
   } catch {

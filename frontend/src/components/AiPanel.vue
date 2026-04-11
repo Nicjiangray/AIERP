@@ -446,6 +446,7 @@ function writePreviewExpertExplanation(wp) {
   return t != null && String(t).trim() !== '' ? String(t).trim() : ''
 }
 import { useAuthStore } from '../stores/auth'
+import { API_BASE } from '@/config/api'
 
 const authStore = useAuthStore()
 
@@ -549,8 +550,6 @@ function formatPreviewValue(v) {
   if (typeof v === 'object') return JSON.stringify(v)
   return String(v)
 }
-
-const API_BASE = ''
 
 const feedbackOpenIndex = ref(null)
 const feedbackDraft = ref('')

@@ -1,7 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-
-const API = ''
+import { API_BASE } from './src/config/api.js'
 
 export const useAppStore = defineStore('app', () => {
   const tables = ref({ meta: [], business: [] })
@@ -9,7 +8,7 @@ export const useAppStore = defineStore('app', () => {
 
   async function fetchTables() {
     try {
-      const res = await fetch(`${API}/tables`)
+      const res = await fetch(`${API_BASE}/tables`)
       const data = await res.json()
       tables.value.meta = data.filter(t => t.schema === 'meta').map(t => t.table)
       tables.value.business = data.filter(t => t.schema === 'business').map(t => t.table)
@@ -21,7 +20,7 @@ export const useAppStore = defineStore('app', () => {
   async function fetchTableData(schema, table, limit = 100) {
     loading.value = true
     try {
-      const res = await fetch(`${API}/table/${schema}/${table}?limit=${limit}`)
+      const res = await fetch(`${API_BASE}/table/${schema}/${table}?limit=${limit}`)
       return await res.json()
     } catch (e) {
       console.error('fetchTableData failed', e)

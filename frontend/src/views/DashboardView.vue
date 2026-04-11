@@ -29,8 +29,7 @@ import BarCard from '../components/dashboard/BarCard.vue'
 import PieCard from '../components/dashboard/PieCard.vue'
 import LineCard from '../components/dashboard/LineCard.vue'
 import ListCard from '../components/dashboard/ListCard.vue'
-
-const API = ''
+import { API_BASE } from '../config/api'
 
 const authStore = useAuthStore()
 const now = new Date().toLocaleDateString('zh-CN', {
@@ -52,7 +51,7 @@ onMounted(async () => {
   loading.value = true
   loadError.value = ''
   try {
-    const res = await fetch(`${API}/api/dashboard?user_id=${encodeURIComponent(uid)}`)
+    const res = await fetch(`${API_BASE}/api/dashboard?user_id=${encodeURIComponent(uid)}`)
     const data = await res.json().catch(() => ({}))
     if (!res.ok) {
       const d = data?.detail

@@ -62,6 +62,7 @@
 
 <script setup>
 import { ref, nextTick } from 'vue'
+import { API_BASE } from './src/config/api.js'
 
 const messages = ref([])
 const inputText = ref('')
@@ -114,7 +115,7 @@ async function sendMessage(text) {
       content: m.content
     }))
 
-    const res = await fetch('/ai/chat', {
+    const res = await fetch(`${API_BASE}/ai/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ messages: history })

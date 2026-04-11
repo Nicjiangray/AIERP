@@ -1,8 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
+import { API_BASE, apiUrlBase } from '../config/api'
 import { buildExportXlsxUrl } from '../utils/tableExport'
-
-const API = ''
 
 export const useAppStore = defineStore('app', () => {
   const tables = ref({ meta: [], business: [] })
@@ -13,7 +12,7 @@ export const useAppStore = defineStore('app', () => {
 
   async function fetchTables() {
     try {
-      const res = await fetch(`${API}/tables`)
+      const res = await fetch(`${API_BASE}/tables`)
       const data = await res.json()
       tables.value.meta = data.filter(t => t.schema === 'meta').map(t => t.table)
       tables.value.business = data.filter(t => t.schema === 'business').map(t => t.table)
@@ -24,7 +23,7 @@ export const useAppStore = defineStore('app', () => {
 
   async function fetchNavTables() {
     try {
-      const res = await fetch(`${API}/nav/tables`)
+      const res = await fetch(`${API_BASE}/nav/tables`)
       if (!res.ok) throw new Error('nav failed')
       const data = await res.json()
       nav.value = {
@@ -54,7 +53,7 @@ export const useAppStore = defineStore('app', () => {
     }
     try {
       const res = await fetch(
-        `${API}/api/user-menu?user_id=${encodeURIComponent(userId)}`
+        `${API_BASE}/api/user-menu?user_id=${encodeURIComponent(userId)}`
       )
       if (!res.ok) throw new Error('user-menu failed')
       const data = await res.json()
@@ -90,7 +89,7 @@ export const useAppStore = defineStore('app', () => {
     }
     try {
       const res = await fetch(
-        `${API}/meta/table-cn/${encodeURIComponent(name)}`
+        `${API_BASE}/meta/table-cn/${encodeURIComponent(name)}`
       )
       if (!res.ok) {
         tableCnByName.value = { ...tableCnByName.value, [name]: null }
@@ -116,7 +115,7 @@ export const useAppStore = defineStore('app', () => {
 
   async function fetchColumnLabels(tableName) {
     try {
-      const res = await fetch(`${API}/table-columns/${encodeURIComponent(tableName)}`)
+      const res = await fetch(`${API_BASE}/table-columns/${encodeURIComponent(tableName)}`)
       if (!res.ok) return { columns: [] }
       return await res.json()
     } catch (e) {
@@ -128,7 +127,7 @@ export const useAppStore = defineStore('app', () => {
   async function fetchTableData(schema, table, limit = 100, opts = {}) {
     const { filters, q, offset, sortBy, sortOrder } = opts
     try {
-      const u = new URL(`/table/${schema}/${table}`, window.location.origin)
+      const u = new URL(`/table/${schema}/${table}`, apiUrlBase())
       u.searchParams.set('limit', String(limit))
       if (offset != null && offset > 0)
         u.searchParams.set('offset', String(offset))
@@ -154,7 +153,7 @@ export const useAppStore = defineStore('app', () => {
   }
 
   async function tableInsert(schema, table, payload) {
-    const res = await fetch(`${API}/table/${schema}/${table}`, {
+    const res = await fetch(`${API_BASE}/table/${schema}/${table}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -165,7 +164,7 @@ export const useAppStore = defineStore('app', () => {
   }
 
   async function tableUpdate(schema, table, rowId, payload) {
-    const res = await fetch(`${API}/table/${schema}/${table}/${rowId}`, {
+    const res = await fetch(`${API_BASE}/table/${schema}/${table}/${rowId}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -176,7 +175,7 @@ export const useAppStore = defineStore('app', () => {
   }
 
   async function tableDelete(schema, table, rowId) {
-    const res = await fetch(`${API}/table/${schema}/${table}/${rowId}`, {
+    const res = await fetch(`${API_BASE}/table/${schema}/${table}/${rowId}`, {
       method: 'DELETE',
     })
     const data = await res.json().catch(() => ({}))

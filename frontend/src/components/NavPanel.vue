@@ -31,6 +31,7 @@
 
 <script setup>
 import { onMounted, ref } from 'vue'
+import { apiHealthCheckUrl } from '../config/api'
 import { useAppStore } from '../stores/app'
 import { useAuthStore } from '../stores/auth'
 import DataNavPanel from './DataNavPanel.vue'
@@ -41,7 +42,7 @@ const apiOk = ref(false)
 
 onMounted(async () => {
   try {
-    const res = await fetch('/')
+    const res = await fetch(apiHealthCheckUrl())
     apiOk.value = res.ok
     await store.fetchTables()
     if (auth.currentUser?.id != null) {

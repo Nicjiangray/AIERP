@@ -1,8 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
+import { API_BASE } from '../config/api'
 import { useAppStore } from './app'
-
-const API = ''
 
 export const useAuthStore = defineStore('auth', () => {
   const currentUser = ref(null)
@@ -11,7 +10,7 @@ export const useAuthStore = defineStore('auth', () => {
   async function login(login_name, password) {
     loginError.value = ''
     try {
-      const res = await fetch(`${API}/auth/login`, {
+      const res = await fetch(`${API_BASE}/auth/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ login_name, password }),
@@ -42,7 +41,7 @@ export const useAuthStore = defineStore('auth', () => {
     const userId = localStorage.getItem('aierp_user_id')
     if (!userId) return
     try {
-      const res = await fetch(`${API}/auth/me?user_id=${encodeURIComponent(userId)}`)
+      const res = await fetch(`${API_BASE}/auth/me?user_id=${encodeURIComponent(userId)}`)
       if (res.ok) {
         const data = await res.json()
         const u = data.user ?? data

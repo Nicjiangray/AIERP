@@ -73,8 +73,7 @@
 import { ref, computed, watch, onMounted } from 'vue'
 import { NSpin } from 'naive-ui'
 import { useAuthStore } from '../stores/auth'
-
-const API = ''
+import { API_BASE } from '../config/api'
 const auth = useAuthStore()
 
 const uid = computed(() => auth.currentUser?.id ?? null)
@@ -93,8 +92,8 @@ async function loadAll() {
   errLt.value = ''
   try {
     const [c, l] = await Promise.all([
-      fetch(`${API}/ai/memory?user_id=${uid.value}&scope=core`).then((r) => r.json()),
-      fetch(`${API}/ai/memory?user_id=${uid.value}&scope=longterm`).then((r) => r.json()),
+      fetch(`${API_BASE}/ai/memory?user_id=${uid.value}&scope=core`).then((r) => r.json()),
+      fetch(`${API_BASE}/ai/memory?user_id=${uid.value}&scope=longterm`).then((r) => r.json()),
     ])
     coreItems.value = c.items || []
     longtermItems.value = l.items || []
@@ -121,7 +120,7 @@ function cancelEdit() {
 async function saveEdit(row) {
   const content = (editDraft.value || '').trim()
   if (!content) return
-  const res = await fetch(`${API}/ai/memory/${row.id}`, {
+  const res = await fetch(`${API_BASE}/ai/memory/${row.id}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ user_id: uid.value, content }),
@@ -137,7 +136,7 @@ async function saveEdit(row) {
 
 async function removeRow(row) {
   if (!confirm('确定删除这条记忆？')) return
-  const res = await fetch(`${API}/ai/memory/${row.id}?user_id=${uid.value}`, {
+  const res = await fetch(`${API_BASE}/ai/memory/${row.id}?user_id=${uid.value}`, {
     method: 'DELETE',
   })
   if (!res.ok) {
@@ -152,7 +151,7 @@ async function removeRow(row) {
 async function addRow(scope) {
   const content = window.prompt(scope === 'core' ? '请输入核心经验（一行）' : '请输入业务记忆正文')
   if (content == null || !String(content).trim()) return
-  const res = await fetch(`${API}/ai/memory`, {
+  const res = await fetch(`${API_BASE}/ai/memory`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
