@@ -202,6 +202,10 @@
 | `v20_role_rules_self_intro.sql` | 自我介绍 prompt |
 | `v21_role_rules_self_intro_wording.sql` | 自我介绍措辞修订（可选） |
 | `v22_incidents_and_feedback.sql` | 错误采集 + 用户反馈 |
+| `v23_business_nav_all_tables.sql` | 侧栏仅主表；业务顺序：合同→采购→到货→发货→库存→资金；admin 权限矩阵补齐 |
+| `v25_nav_payments_warehouse_read.sql` | **warehouse** 角色补 `payments` 读权限 + 确保 `payments` 导航元数据 |
+| `v26_nav_run_order_main_only.sql` | 侧栏仅主表；`prep` 含联系人；`run` 以合同管理为首；API 忽略 `nav_parent_table` 子表行 |
+| `v27_nav_contacts_prep_contracts_first_run.sql` | 增量：联系人回「系统准备」、`contracts` 置顶「系统运行」并显示「合同管理」（旧版 v26 已跑过时执行） |
 
 ---
 
@@ -402,6 +406,10 @@ aierp/
 | **`v20_role_rules_self_intro.sql`** | **V7**：`role_rules` 追加自我介绍 |
 | **`v21_role_rules_self_intro_wording.sql`** | **V7**：自我介绍措辞修订（可选） |
 | **`v22_incidents_and_feedback.sql`** | **V7**：`ai_incidents` + `ai_feedback`，`include_in_domain_model=false` |
+| **`v23_business_nav_all_tables.sql`** | **V7+**：侧栏**不含子表明细**；`run` 顺序为销售合同→采购→到货→发货→库存→资金；**admin** `role_permissions` 全表补齐 |
+| **`v25_nav_payments_warehouse_read.sql`** | **V7+**：`warehouse` 补 **`business.payments`** 读权限（v17 遗漏）；保证侧栏出现收付款 |
+| **`v26_nav_run_order_main_only.sql`** | **V7+**：侧栏**仅主表**；`prep` 含**联系人**；`run` 以**合同管理**（`contracts`）为首→变更→采购→收付款→到货→发货→库存；**`/api/user-menu`** 排除子表导航 |
+| **`v27_nav_contacts_prep_contracts_first_run.sql`** | **V7+**：曾执行**旧** v26 的库：联系人回 prep、`contracts` 置顶 run |
 
 执行示例：
 

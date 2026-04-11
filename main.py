@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import asyncio
 import io
 import json
@@ -971,6 +975,7 @@ def list_nav_tables():
                 SELECT table_name, table_cn, nav_section, nav_order, nav_parent_table
                 FROM meta.meta_tables
                 WHERE nav_section IS NOT NULL
+                  AND nav_parent_table IS NULL
                 ORDER BY nav_section, nav_order, table_name
                 """
             )
@@ -1002,6 +1007,7 @@ def api_user_menu(
     """
     权限驱动的导航：与 /nav/tables 结构相同，按 can_read 过滤；
     admin/super_admin 可见全部 business 导航项。
+    仅包含 nav_parent_table 为空的项（侧栏只展示主表，子表在详情内查看）。
     """
     try:
         with db_conn() as conn:
@@ -1015,6 +1021,7 @@ def api_user_menu(
                     SELECT table_name, table_cn, nav_section, nav_order, nav_parent_table
                     FROM meta.meta_tables
                     WHERE nav_section IS NOT NULL
+                      AND nav_parent_table IS NULL
                     ORDER BY nav_section, nav_order, table_name
                     """
                 )

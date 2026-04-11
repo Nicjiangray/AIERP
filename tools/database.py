@@ -22,6 +22,7 @@ def _api_pg_kwargs() -> Dict[str, Any]:
         "user": os.environ.get("PGUSER", "nicjiang"),
         "host": os.environ.get("PGHOST", "localhost"),
         "port": int(os.environ.get("PGPORT", "5432")),
+        "password": os.environ.get("PG_API_PASSWORD", ""),
     }
 
 
@@ -34,7 +35,7 @@ def _llm_pg_kwargs() -> Dict[str, Any]:
         "host": os.environ.get("PGHOST", "localhost"),
         "dbname": os.environ.get("PGDATABASE", "aierp"),
         "user": os.environ.get("PGUSER", "llm_assistant"),
-        "password": os.environ.get("PGPASSWORD", "llm_safe_2024"),
+        "password": os.environ.get("PG_LLM_PASSWORD", "llm_safe_2024"),
         "port": port,
     }
 
