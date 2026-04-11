@@ -6,7 +6,7 @@ engine/prompt_builder.py
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import List, Optional
 
 from tools.database import db_conn
 
@@ -25,7 +25,7 @@ def build_prompt(agent_role: str, user_id: Optional[int] = None) -> str:
 
     参数：
         agent_role: 'assistant' | 'tool_expert' | 'memory_manager'
-        user_id: 用户 ID，assistant 角色时用于注入记忆，其他角色可不传
+        user_id: employees.id；assistant 注入记忆；tool_expert 注入当前操作人与角色上下文
 
     返回：
         拼装好的 system prompt 字符串
@@ -55,6 +55,12 @@ def build_prompt(agent_role: str, user_id: Optional[int] = None) -> str:
         memory_parts = _load_user_memory(user_id)
         if memory_parts:
             parts.append(memory_parts)
+
+    # 3. tool_expert：当前操作人（员工、角色、owner_id / 审批 / 主管可见范围）
+    if agent_role == "tool_expert" and user_id is not None:
+        ctx = _build_tool_expert_operator_context(user_id)
+        if ctx:
+            parts.append(ctx)
 
     return "\n\n".join(parts)
 
@@ -178,3 +184,86 @@ def _load_user_memory(user_id: int) -> str:
         return _pack_memory(core_text, "", "")
 
     return cur_pack
+
+
+def _tool_expert_role_codes(cur, employee_id: int) -> List[str]:
+    cur.execute(
+        """
+        SELECT DISTINCT rg.role_code
+        FROM business.user_role_grants rg
+        JOIN business.user_accounts ua ON ua.id = rg.user_account_id
+        WHERE ua.employee_id = %s AND ua.is_active = true
+        """,
+        (employee_id,),
+    )
+    return [str(r[0]) for r in cur.fetchall() if r and r[0]]
+
+
+def _fetch_subordinates(cur, manager_employee_id: int) -> List[dict]:
+    """直属下属（employees.manager_id）；表或列未就绪时返回空列表。"""
+    try:
+        cur.execute(
+            """
+            SELECT id, name FROM business.employees
+            WHERE manager_id = %s
+              AND (status IS NULL OR LOWER(TRIM(status)) = 'active')
+            ORDER BY id
+            """,
+            (manager_employee_id,),
+        )
+        return [{"id": int(r[0]), "name": r[1] or ""} for r in cur.fetchall() if r]
+    except Exception:
+        return []
+
+
+def _build_tool_expert_operator_context(user_id: int) -> str:
+    """tool_expert 注入：操作人、角色、下属与 owner_id 可见范围说明。"""
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, emp_code, name, department, role_tags
+                FROM business.employees
+                WHERE id = %s
+                """,
+                (user_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return ""
+            eid, emp_code, name, dept, role_tags = row
+            roles = _tool_expert_role_codes(cur, int(eid))
+            subs = _fetch_subordinates(cur, int(eid))
+    lines = [
+        "【当前操作人】",
+        f"- 员工 id（employees.id，与 SQL 引擎 user_id 一致）: {eid}",
+        f"- 工号: {emp_code or ''}  姓名: {name or ''}  部门: {dept or ''}",
+    ]
+    if role_tags:
+        lines.append(f"- 员工标签: {role_tags}")
+    if roles:
+        lines.append(f"- 账号角色（user_role_grants）: {', '.join(roles)}")
+    else:
+        lines.append("- 账号角色: （未分配，表级权限可能拒绝）")
+
+    if subs:
+        sub_names = "、".join(s["name"] for s in subs if s.get("name"))
+        sub_ids = [s["id"] for s in subs]
+        id_list = ", ".join(str(i) for i in [eid] + sub_ids)
+        lines.append(f"- 下属: {sub_names}")
+        lines.append(f"- 数据可见范围（有 owner_id 的表）: owner_id IN ({id_list})")
+        lines.append(
+            "- 查询这类表时，用上述 IN 条件；不要用仅本人 owner_id = 单值，除非用户只要自己的数据。"
+        )
+    else:
+        lines.append(
+            f"- 查询有 owner_id 的表时，通常加 WHERE owner_id = {eid}（除非用户明确要求看他人数据且你有权）。"
+        )
+
+    lines.extend(
+        [
+            "- 写入 customers / contracts / purchase_orders / shipping_notes 时，业务上需要请设置 owner_id 为当前员工 id。",
+            "- 新建合同、采购订单在用户确认写入后，系统会将单据置为待审批并生成审批记录；无需在 SQL 中插入 business.approvals。",
+        ]
+    )
+    return "\n".join(lines)

@@ -11,7 +11,7 @@
             class="nav-link"
             :class="{ active: isActive(item) }"
           >
-            <span class="nav-cn">{{ item.table_cn || item.table_name }}</span>
+            <span class="nav-cn">{{ navLabelCn(item) }}</span>
             <span class="nav-en mono">{{ item.table_name }}</span>
           </router-link>
         </div>
@@ -25,9 +25,11 @@ import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { NCollapse, NCollapseItem } from 'naive-ui'
 import { useAppStore } from '../stores/app'
+import { useAuthStore } from '../stores/auth'
 import { navItemInSplitGroup } from '../config/tableSplit'
 
 const store = useAppStore()
+const auth = useAuthStore()
 const route = useRoute()
 const loading = ref(true)
 
@@ -47,6 +49,14 @@ function isActive(item) {
   return false
 }
 
+/** 优先 meta 导航里的 table_cn，否则用 /meta/table-cn 补全后的缓存 */
+function navLabelCn(item) {
+  if (item.table_cn) return item.table_cn
+  const cached = store.tableCnByName[item.table_name]
+  if (cached) return cached
+  return item.table_name
+}
+
 onMounted(async () => {
   if (
     store.nav.design.length ||
@@ -54,11 +64,25 @@ onMounted(async () => {
     store.nav.run.length
   ) {
     loading.value = false
-    return
+  } else {
+    loading.value = true
+    if (auth.currentUser?.id != null) {
+      await store.fetchUserMenu(auth.currentUser.id)
+    } else {
+      await store.fetchNavTables()
+    }
+    loading.value = false
   }
-  loading.value = true
-  await store.fetchNavTables()
-  loading.value = false
+  const all = [
+    ...store.nav.design,
+    ...store.nav.prep,
+    ...store.nav.run,
+  ]
+  await Promise.all(
+    all
+      .filter((i) => i.table_name && !i.table_cn)
+      .map((i) => store.ensureTableCn(i.table_name))
+  )
 })
 </script>
 

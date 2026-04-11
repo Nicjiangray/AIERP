@@ -47,7 +47,7 @@ import { h } from 'vue'
 const route = useRoute()
 const store = useAppStore()
 
-const schema = computed(() => route.path.startsWith('/meta') ? 'meta' : 'business')
+const schema = computed(() => 'business')
 const tableName = computed(() => route.params.table)
 
 const rows = ref([])

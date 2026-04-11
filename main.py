@@ -33,12 +33,14 @@ from engine.memory_manager import (
     extract_core_facts,
     maybe_clean_previous_session,
 )
+from engine.incident_logger import log_incident
 from engine.prompt_builder import build_prompt
 from engine.sql_engine import (
     confirm_batch_sql,
     execute_sql,
     highlight_words_from_summary,
     preview_sql,
+    user_can_read_table,
     verify_confirmed_writes,
 )
 from llm.client import (
@@ -227,6 +229,9 @@ def _is_write_preview_result(result: Dict[str, Any]) -> bool:
 
 async def _run_tool_expert_dialog(
     expert_messages: List[Dict[str, Any]],
+    user_id: Optional[int] = None,
+    session_id: Optional[int] = None,
+    trace_user_input: Optional[str] = None,
 ) -> Dict[str, Any]:
     """tool_expert 多轮对话：query / write / done，与入口消息无关（由调用方注入）。"""
     pending_writes: List[Dict[str, Any]] = []
@@ -242,7 +247,18 @@ async def _run_tool_expert_dialog(
             len(expert_messages),
         )
         logger.info(f"tool_expert: 第 {step + 1}/{MAX_EXPERT_STEPS} 步")
-        expert_reply = await asyncio.to_thread(_run_expert)
+        try:
+            expert_reply = await asyncio.to_thread(_run_expert)
+        except Exception as e:
+            log_incident(
+                stage="llm_call",
+                error_message=str(e),
+                session_id=session_id,
+                user_id=user_id,
+                user_input=trace_user_input,
+                context={"step": step + 1, "dialog": "tool_expert"},
+            )
+            return {"success": False, "error": str(e)}
         logger.info(f"tool_expert: 回复:\n{expert_reply}")
         logger.info(
             "tool_expert_detail | model_raw | n=%d | chars=%d | head=%r",
@@ -253,6 +269,17 @@ async def _run_tool_expert_dialog(
 
         payload = _extract_json_from_text(expert_reply)
         if not payload:
+            log_incident(
+                stage="parse",
+                error_message="工具专家未返回有效 JSON 指令",
+                session_id=session_id,
+                user_id=user_id,
+                user_input=trace_user_input,
+                context={
+                    "raw_head": (expert_reply or "")[:2000],
+                    "step": step + 1,
+                },
+            )
             return {"success": False, "error": "工具专家未返回有效指令"}
 
         logger.info(f"orchestrator: expert payload: {payload}")
@@ -342,7 +369,7 @@ async def _run_tool_expert_dialog(
 
             def _do_query() -> Dict[str, Any]:
                 with db_conn() as conn:
-                    return execute_sql(sql, params_list, conn)
+                    return execute_sql(sql, params_list, conn, user_id=user_id)
 
             exec_result = await asyncio.to_thread(_do_query)
             logger.info(
@@ -392,7 +419,7 @@ async def _run_tool_expert_dialog(
 
             def _do_preview() -> Dict[str, Any]:
                 with db_conn() as conn:
-                    return preview_sql(sql, params_list, conn)
+                    return preview_sql(sql, params_list, conn, user_id=user_id)
 
             exec_result = await asyncio.to_thread(_do_preview)
             logger.info(
@@ -491,20 +518,44 @@ async def _run_tool_expert_dialog(
         return {"success": False, "error": f"未知指令类型: {cmd_type}"}
 
     if pending_writes:
+        _msg = f"已达最大步数（{MAX_EXPERT_STEPS}），仍有 {len(pending_writes)} 条写入待汇总；请输出 done 并附 summary，或拆分任务"
+        log_incident(
+            stage="expert",
+            error_message=_msg,
+            session_id=session_id,
+            user_id=user_id,
+            user_input=trace_user_input,
+            context={
+                "pending_staged": len(pending_writes),
+                "max_steps": MAX_EXPERT_STEPS,
+            },
+        )
         return {
             "success": False,
-            "error": f"已达最大步数（{MAX_EXPERT_STEPS}），仍有 {len(pending_writes)} 条写入待汇总；请输出 done 并附 summary，或拆分任务",
+            "error": _msg,
             "pending_staged": len(pending_writes),
         }
+    log_incident(
+        stage="expert",
+        error_message="操作步骤过多，未能完成",
+        session_id=session_id,
+        user_id=user_id,
+        user_input=trace_user_input,
+        context={"max_steps": MAX_EXPERT_STEPS},
+    )
     return {"success": False, "error": "操作步骤过多，未能完成"}
 
 
-async def _call_tool_expert(tool_block: Dict[str, str]) -> Dict[str, Any]:
+async def _call_tool_expert(
+    tool_block: Dict[str, str],
+    user_id: Optional[int] = None,
+    session_id: Optional[int] = None,
+) -> Dict[str, Any]:
     """
     把助手的意图指令发给 tool_expert；expert 内部多步执行（query / write / done），
     闭环完成后返回最终结果（摘要、错误或写预览）。
     """
-    expert_system = build_prompt("tool_expert")
+    expert_system = build_prompt("tool_expert", user_id=user_id)
     user_msg = "\n".join(f"{k}: {v}" for k, v in tool_block.items())
     logger.info(f"orchestrator: 调用 tool_expert, 发送内容:\n{user_msg}")
     expert_messages: List[Dict[str, Any]] = [
@@ -516,7 +567,12 @@ async def _call_tool_expert(tool_block: Dict[str, str]) -> Dict[str, Any]:
         MAX_EXPERT_STEPS,
         list(tool_block.keys()),
     )
-    return await _run_tool_expert_dialog(expert_messages)
+    return await _run_tool_expert_dialog(
+        expert_messages,
+        user_id=user_id,
+        session_id=session_id,
+        trace_user_input=user_msg,
+    )
 
 
 async def _call_tool_expert_recover_after_failed_confirm(
@@ -524,9 +580,11 @@ async def _call_tool_expert_recover_after_failed_confirm(
     failed_batch: List[Dict[str, Any]],
     last_confirm: Optional[Dict[str, Any]],
     tool_context: Optional[Dict[str, Any]] = None,
+    user_id: Optional[int] = None,
+    session_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """用户已点确认后执行或校验失败：由专家重写 batch（服务端自动再执行，无需用户再点预览）。"""
-    expert_system = build_prompt("tool_expert")
+    expert_system = build_prompt("tool_expert", user_id=user_id)
     payload: Dict[str, Any] = {
         "phase": "recover_after_user_confirm",
         "说明": (
@@ -552,7 +610,12 @@ async def _call_tool_expert_recover_after_failed_confirm(
         len(failed_batch),
         _trunc_for_log(failure_reason, 300),
     )
-    return await _run_tool_expert_dialog(expert_messages)
+    return await _run_tool_expert_dialog(
+        expert_messages,
+        user_id=user_id,
+        session_id=session_id,
+        trace_user_input=user_msg,
+    )
 
 
 def _insert_ai_chat_row(session_id: int, role: str, content: str) -> None:
@@ -635,6 +698,15 @@ app.add_middleware(
 IDENT_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 ALLOWED_SCHEMAS = frozenset({"meta", "business", "ai_assistant"})
 BLOCK_COLUMNS = frozenset({"password_hash", "embedding", "intent_embedding"})
+
+
+def _forbid_meta_table_api(schema: str) -> None:
+    """通用表 CRUD/导出禁止走 HTTP 访问 meta（设计者请用 psql）。"""
+    if (schema or "").strip().lower() == "meta":
+        raise HTTPException(
+            status_code=403,
+            detail="系统表不可通过界面访问",
+        )
 
 
 def assert_ident(name: str, label: str = "identifier") -> None:
@@ -865,7 +937,7 @@ def list_tables():
                 """
                 SELECT table_schema AS schema, table_name AS table
                 FROM information_schema.tables
-                WHERE table_schema IN ('meta', 'business', 'ai_assistant')
+                WHERE table_schema IN ('business', 'ai_assistant')
                   AND table_type = 'BASE TABLE'
                 ORDER BY table_schema, table_name
                 """
@@ -909,7 +981,7 @@ def list_nav_tables():
             if sec not in out:
                 continue
             sch = schema_map.get(r["table_name"])
-            if not sch:
+            if not sch or sch == "meta":
                 continue
             out[sec].append(
                 {
@@ -923,9 +995,186 @@ def list_nav_tables():
         return out
 
 
+@app.get("/api/user-menu")
+def api_user_menu(
+    user_id: int = Query(..., description="employees.id，登录用户 id"),
+):
+    """
+    权限驱动的导航：与 /nav/tables 结构相同，按 can_read 过滤；
+    admin/super_admin 可见全部 business 导航项。
+    """
+    try:
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                roles = _employee_role_codes(cur, user_id)
+            privileged = any(r in ("admin", "super_admin") for r in roles)
+            schema_map = _schema_by_table_name(conn)
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT table_name, table_cn, nav_section, nav_order, nav_parent_table
+                    FROM meta.meta_tables
+                    WHERE nav_section IS NOT NULL
+                    ORDER BY nav_section, nav_order, table_name
+                    """
+                )
+                rows = cur.fetchall()
+            out: Dict[str, List[Dict[str, Any]]] = {"design": [], "prep": [], "run": []}
+            for r in rows:
+                sec = r.get("nav_section")
+                if sec not in out:
+                    continue
+                sch = schema_map.get(r["table_name"])
+                if not sch or sch == "meta":
+                    continue
+                if sch != "business":
+                    continue
+                full_tn = f"business.{r['table_name']}"
+                if not privileged and not user_can_read_table(conn, user_id, full_tn):
+                    continue
+                out[sec].append(
+                    {
+                        "schema": sch,
+                        "table_name": r["table_name"],
+                        "table_cn": r["table_cn"],
+                        "nav_order": r["nav_order"],
+                        "nav_parent_table": r["nav_parent_table"],
+                    }
+                )
+        return {
+            "design": out["design"],
+            "prep": out["prep"],
+            "run": out["run"],
+            "role": roles,
+        }
+    except Exception as e:
+        logger.exception("api/user-menu: %s", e)
+        raise HTTPException(status_code=500, detail="菜单加载失败") from e
+
+
+def _apply_dashboard_user_id(sql: str, user_id: int) -> str:
+    """将卡片 SQL 中的 :user_id 替换为当前登录员工 id（整数）。"""
+    return (sql or "").replace(":user_id", str(int(user_id)))
+
+
+@app.get("/api/dashboard")
+def get_dashboard(user_id: int = Query(..., description="employees.id")):
+    """
+    个人卡片优先；无则角色默认卡片。
+    每张卡片的 query_sql 经 execute_sql 执行（仅 SELECT，R1–R7）。
+    """
+    results: List[Dict[str, Any]] = []
+    try:
+        with db_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, employee_id, role_code, title, card_type, query_sql, description,
+                           display_order, card_config, is_active, created_by, created_at, updated_at
+                    FROM business.dashboard_cards
+                    WHERE employee_id = %s AND is_active = true AND deleted_at IS NULL
+                    ORDER BY display_order, id
+                    """,
+                    (user_id,),
+                )
+                cards = cur.fetchall()
+
+            if not cards:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT DISTINCT rg.role_code
+                        FROM business.user_role_grants rg
+                        JOIN business.user_accounts ua ON ua.id = rg.user_account_id
+                        WHERE ua.employee_id = %s AND ua.is_active = true
+                        """,
+                        (user_id,),
+                    )
+                    role_codes = [r[0] for r in cur.fetchall() if r and r[0]]
+                if role_codes:
+                    with conn.cursor(
+                        cursor_factory=psycopg2.extras.RealDictCursor
+                    ) as cur:
+                        cur.execute(
+                            """
+                            SELECT id, employee_id, role_code, title, card_type, query_sql, description,
+                                   display_order, card_config, is_active, created_by, created_at, updated_at
+                            FROM business.dashboard_cards
+                            WHERE role_code = ANY(%s) AND employee_id IS NULL
+                              AND is_active = true AND deleted_at IS NULL
+                            ORDER BY display_order, id
+                            """,
+                            (list(role_codes),),
+                        )
+                        cards = cur.fetchall()
+                else:
+                    cards = []
+
+            for card in cards:
+                raw_sql = card["query_sql"] or ""
+                sql = _apply_dashboard_user_id(raw_sql, user_id)
+                cfg = card.get("card_config")
+                if isinstance(cfg, str):
+                    try:
+                        cfg = json.loads(cfg)
+                    except Exception:
+                        cfg = {}
+                elif cfg is None or not isinstance(cfg, dict):
+                    cfg = {}
+                base: Dict[str, Any] = {
+                    "id": card["id"],
+                    "title": card["title"],
+                    "card_type": card["card_type"],
+                    "description": card.get("description"),
+                    "card_config": cfg,
+                }
+                out = execute_sql(sql, conn=conn, user_id=user_id)
+                if out.get("success"):
+                    base["data"] = out.get("rows") or []
+                    base["error"] = None
+                else:
+                    base["data"] = []
+                    base["error"] = out.get("error") or "执行失败"
+                results.append(base)
+
+        return jsonable_encoder({"cards": results})
+    except Exception as e:
+        logger.exception("api/dashboard: %s", e)
+        raise HTTPException(status_code=500, detail="您还未创建个人仪表盘。") from e
+
+
+@app.get("/meta/table-cn/{table_name}")
+def get_table_cn(table_name: str):
+    """从 meta.meta_tables 取中文表名（用于未出现在导航列表中的子表等）。"""
+    assert_ident(table_name, "table_name")
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT table_name, table_cn
+                FROM meta.meta_tables
+                WHERE table_name = %s
+                """,
+                (table_name,),
+            )
+            r = cur.fetchone()
+    if not r:
+        return {"table_name": table_name, "table_cn": None}
+    cn = r.get("table_cn")
+    return {"table_name": r["table_name"], "table_cn": cn if cn else None}
+
+
 @app.get("/table-columns/{table_name}")
 def get_table_column_labels(table_name: str):
+    assert_ident(table_name, "table_name")
     with db_conn() as conn:
+        schema_map = _schema_by_table_name(conn)
+        sch = schema_map.get(table_name)
+        if sch == "meta":
+            raise HTTPException(
+                status_code=403,
+                detail="系统表不可通过界面访问",
+            )
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
@@ -955,6 +1204,7 @@ def get_table(
 ):
     if schema not in ALLOWED_SCHEMAS:
         raise HTTPException(status_code=400, detail="Invalid schema")
+    _forbid_meta_table_api(schema)
     assert_ident(table_name, "table_name")
     lim = min(max(1, limit), 5000)
     off = max(0, min(offset, 1_000_000))
@@ -1057,6 +1307,7 @@ def export_table_xlsx(
 
     if schema not in ALLOWED_SCHEMAS:
         raise HTTPException(status_code=400, detail="Invalid schema")
+    _forbid_meta_table_api(schema)
     assert_ident(table_name, "table_name")
     lim = min(max(1, limit), 10000)
     so = normalize_sort_order_param(sort_order)
@@ -1124,6 +1375,7 @@ def export_table_xlsx(
 def table_insert(schema: str, table_name: str, body: Dict[str, Any] = Body(...)):
     if schema not in ALLOWED_SCHEMAS:
         raise HTTPException(status_code=400, detail="Invalid schema")
+    _forbid_meta_table_api(schema)
     assert_ident(schema, "schema")
     assert_ident(table_name, "table_name")
     with db_conn() as conn:
@@ -1162,6 +1414,7 @@ def table_insert(schema: str, table_name: str, body: Dict[str, Any] = Body(...))
 def table_update(schema: str, table_name: str, row_id: int, body: Dict[str, Any] = Body(...)):
     if schema not in ALLOWED_SCHEMAS:
         raise HTTPException(status_code=400, detail="Invalid schema")
+    _forbid_meta_table_api(schema)
     assert_ident(schema, "schema")
     assert_ident(table_name, "table_name")
     with db_conn() as conn:
@@ -1203,6 +1456,7 @@ def table_update(schema: str, table_name: str, row_id: int, body: Dict[str, Any]
 def table_delete(schema: str, table_name: str, row_id: int):
     if schema not in ALLOWED_SCHEMAS:
         raise HTTPException(status_code=400, detail="Invalid schema")
+    _forbid_meta_table_api(schema)
     assert_ident(schema, "schema")
     assert_ident(table_name, "table_name")
     with db_conn() as conn:
@@ -1355,6 +1609,165 @@ async def auth_me(user_id: int = Query(..., description="employees.id")):
     return {"user": user}
 
 
+def _employee_role_codes(cur, employee_id: int) -> List[str]:
+    cur.execute(
+        """
+        SELECT DISTINCT rg.role_code
+        FROM business.user_role_grants rg
+        JOIN business.user_accounts ua ON ua.id = rg.user_account_id
+        WHERE ua.employee_id = %s AND ua.is_active = true
+        """,
+        (employee_id,),
+    )
+    return [str(r[0]) for r in cur.fetchall() if r and r[0]]
+
+
+@app.get("/approvals/pending")
+async def approvals_pending(
+    user_id: int = Query(..., description="employees.id，用于筛选与我相关的待办"),
+):
+    """待审批列表：本人发起或指派给本人的 pending；admin/super_admin 可见全部 pending。"""
+    try:
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                roles = _employee_role_codes(cur, user_id)
+            privileged = any(r in ("admin", "super_admin") for r in roles)
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                if privileged:
+                    cur.execute(
+                        """
+                        SELECT a.id, a.approval_no, a.target_type, a.target_id, a.target_no,
+                               a.requested_by, a.requested_at, a.approver_id, a.status,
+                               e1.name AS requested_by_name,
+                               e2.name AS approver_name
+                        FROM business.approvals a
+                        LEFT JOIN business.employees e1 ON e1.id = a.requested_by
+                        LEFT JOIN business.employees e2 ON e2.id = a.approver_id
+                        WHERE a.deleted_at IS NULL AND a.status = 'pending'
+                        ORDER BY a.requested_at DESC
+                        """
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT a.id, a.approval_no, a.target_type, a.target_id, a.target_no,
+                               a.requested_by, a.requested_at, a.approver_id, a.status,
+                               e1.name AS requested_by_name,
+                               e2.name AS approver_name
+                        FROM business.approvals a
+                        LEFT JOIN business.employees e1 ON e1.id = a.requested_by
+                        LEFT JOIN business.employees e2 ON e2.id = a.approver_id
+                        WHERE a.deleted_at IS NULL AND a.status = 'pending'
+                          AND (a.requested_by = %s OR a.approver_id = %s)
+                        ORDER BY a.requested_at DESC
+                        """,
+                        (user_id, user_id),
+                    )
+                rows = cur.fetchall() or []
+    except Exception as e:
+        logger.exception("approvals/pending: %s", e)
+        raise HTTPException(status_code=500, detail="查询失败") from e
+    return {"items": [dict(r) for r in rows]}
+
+
+class ApprovalDecideRequest(BaseModel):
+    user_id: int = Field(..., description="employees.id，审批人")
+    decision: str = Field(..., description="approved 或 rejected")
+    comment: Optional[str] = None
+
+
+@app.post("/approvals/{approval_id}/decide")
+async def approval_decide(approval_id: int, body: ApprovalDecideRequest):
+    """审批通过/驳回，并回写合同或采购订单状态。"""
+    d = (body.decision or "").strip().lower()
+    if d not in ("approved", "rejected"):
+        raise HTTPException(status_code=400, detail="decision 须为 approved 或 rejected")
+    comment = (body.comment or "").strip() or None
+    try:
+        with db_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, target_type, target_id, status, requested_by, approver_id
+                    FROM business.approvals
+                    WHERE id = %s AND deleted_at IS NULL
+                    """,
+                    (approval_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="审批单不存在")
+                if (row.get("status") or "") != "pending":
+                    raise HTTPException(status_code=400, detail="该审批单已处理")
+
+                roles = _employee_role_codes(cur, body.user_id)
+                is_admin = any(r in ("admin", "super_admin") for r in roles)
+                aid = row.get("approver_id")
+                if not is_admin:
+                    if aid is not None and int(aid) != int(body.user_id):
+                        raise HTTPException(status_code=403, detail="无权审批该单据")
+                    if aid is None:
+                        raise HTTPException(
+                            status_code=403,
+                            detail="未指定审批人时仅管理员可审批",
+                        )
+
+                new_ap_status = "approved" if d == "approved" else "rejected"
+                cur.execute(
+                    """
+                    UPDATE business.approvals
+                    SET status = %s,
+                        decision_at = NOW(),
+                        comment = %s,
+                        approver_id = COALESCE(approver_id, %s),
+                        updated_at = NOW()
+                    WHERE id = %s AND status = 'pending'
+                    RETURNING id
+                    """,
+                    (new_ap_status, comment, body.user_id, approval_id),
+                )
+                if not cur.fetchone():
+                    raise HTTPException(status_code=400, detail="更新审批单失败")
+
+                tt = str(row.get("target_type") or "")
+                tid = row.get("target_id")
+                if tid is None:
+                    conn.rollback()
+                    raise HTTPException(status_code=500, detail="审批单缺少 target_id")
+                tid = int(tid)
+
+                if d == "approved":
+                    if tt == "contract":
+                        cur.execute(
+                            "UPDATE business.contracts SET status = 'active' WHERE id = %s",
+                            (tid,),
+                        )
+                    elif tt == "purchase_order":
+                        # 与合同审批通过后均为 active，下游只认一种「已生效」状态
+                        cur.execute(
+                            "UPDATE business.purchase_orders SET status = 'active' WHERE id = %s",
+                            (tid,),
+                        )
+                else:
+                    if tt == "contract":
+                        cur.execute(
+                            "UPDATE business.contracts SET status = 'rejected' WHERE id = %s",
+                            (tid,),
+                        )
+                    elif tt == "purchase_order":
+                        cur.execute(
+                            "UPDATE business.purchase_orders SET status = 'rejected' WHERE id = %s",
+                            (tid,),
+                        )
+            conn.commit()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("approvals/decide: %s", e)
+        raise HTTPException(status_code=500, detail="处理失败") from e
+    return {"ok": True, "approval_id": approval_id, "status": new_ap_status}
+
+
 # ── AI Chat（直连 LLM，与前端 AiPanel 协议对齐）──────────────────────────────
 
 
@@ -1372,6 +1785,13 @@ class WriteConfirmRequest(BaseModel):
     frame_id: Optional[int] = None
     confirmed: Optional[bool] = None
     session_id: Optional[int] = None
+    user_id: Optional[int] = Field(
+        default=None,
+        description=(
+            "employees.id，用于 R7 与审批；应与发起预览时为同一登录用户，"
+            "否则可能出现预览通过但确认阶段因角色不同被拒"
+        ),
+    )
 
 
 class ChatLogMessageRequest(BaseModel):
@@ -1492,6 +1912,8 @@ def _batch_from_write_preview(expert_out: Dict[str, Any]) -> Optional[List[Dict[
 async def _confirm_writes_with_verify_and_recovery(
     batch: List[Dict[str, Any]],
     tool_context: Optional[Dict[str, Any]] = None,
+    user_id: Optional[int] = None,
+    session_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """执行前意图检查 → 执行 → 校验；失败则调用专家重写 SQL，最多共 MAX_WRITE_CONFIRM_ATTEMPTS 次执行尝试。"""
     current: List[Dict[str, Any]] = [dict(x) for x in batch]
@@ -1517,10 +1939,23 @@ async def _confirm_writes_with_verify_and_recovery(
                 current,
                 None,
                 tool_context,
+                user_id=user_id,
+                session_id=session_id,
             )
             new_batch = _batch_from_write_preview(expert_out)
             if not new_batch:
                 err = expert_out.get("error") or "专家未返回可执行的写入预览"
+                log_incident(
+                    stage="confirm",
+                    error_message=str(err),
+                    session_id=session_id,
+                    user_id=user_id,
+                    generated_sql=json.dumps(current, ensure_ascii=False, default=str)[:5000],
+                    context={
+                        "phase": "intent_verify",
+                        "failure_reason": (failure_reason or "")[:800],
+                    },
+                )
                 return {
                     "success": False,
                     "error": f"任务失败：{err}",
@@ -1535,9 +1970,17 @@ async def _confirm_writes_with_verify_and_recovery(
         def _run_one() -> Dict[str, Any]:
             with db_conn() as conn:
                 try:
-                    return confirm_batch_sql(current, conn)
+                    return confirm_batch_sql(current, conn, user_id=user_id)
                 except Exception as e:
                     logger.exception("ai/confirm confirm_batch_sql: %s", e)
+                    log_incident(
+                        stage="execute",
+                        error_message=str(e),
+                        session_id=session_id,
+                        user_id=user_id,
+                        generated_sql=json.dumps(current, ensure_ascii=False, default=str)[:5000],
+                        context={"fn": "confirm_batch_sql", "phase": "confirm_path"},
+                    )
                     return {"success": False, "error": f"执行异常：{e}"}
 
         confirm_result = await asyncio.to_thread(_run_one)
@@ -1577,10 +2020,23 @@ async def _confirm_writes_with_verify_and_recovery(
             current,
             confirm_result,
             tool_context,
+            user_id=user_id,
+            session_id=session_id,
         )
         new_batch = _batch_from_write_preview(expert_out)
         if not new_batch:
             err = expert_out.get("error") or "专家未返回可执行的写入预览"
+            log_incident(
+                stage="confirm",
+                error_message=str(err),
+                session_id=session_id,
+                user_id=user_id,
+                generated_sql=json.dumps(current, ensure_ascii=False, default=str)[:5000],
+                context={
+                    "phase": "post_exec",
+                    "failure_reason": (failure_reason or "")[:800],
+                },
+            )
             return {
                 "success": False,
                 "error": f"任务失败：{err}",
@@ -1650,14 +2106,137 @@ async def ai_confirm(body: WriteConfirmRequest):
     batch = _validate_write_payload_to_batch(pl)
     tc = pl.get("tool_context")
     tool_context = tc if isinstance(tc, dict) else None
-    result = await _confirm_writes_with_verify_and_recovery(batch, tool_context)
     sid = body.session_id
+    result = await _confirm_writes_with_verify_and_recovery(
+        batch,
+        tool_context,
+        user_id=body.user_id,
+        session_id=sid,
+    )
     if sid is not None:
         try:
             _insert_ai_chat_row(sid, "assistant", _assistant_line_from_write_confirm_result(result))
         except Exception as e:
             logger.warning("ai/confirm: 写入 ai_chat 收尾失败 session_id=%s err=%s", sid, e)
     return result
+
+
+@app.post("/ai/feedback")
+async def submit_ai_feedback(body: Dict[str, Any] = Body(...)):
+    """用户主动反馈（👎 等）；写入 business.ai_feedback。"""
+    raw_uid = body.get("user_id")
+    if raw_uid is None:
+        raise HTTPException(status_code=400, detail="需要 user_id")
+    try:
+        user_id_fb = int(raw_uid)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="user_id 无效")
+
+    sid_raw = body.get("session_id")
+    session_id_fb: Optional[int] = None
+    if sid_raw is not None:
+        try:
+            session_id_fb = int(sid_raw)
+        except (TypeError, ValueError):
+            session_id_fb = None
+
+    chat_id_raw = body.get("chat_id")
+    chat_id_fb: Optional[int] = None
+    if chat_id_raw is not None:
+        try:
+            chat_id_fb = int(chat_id_raw)
+        except (TypeError, ValueError):
+            chat_id_fb = None
+
+    feedback_type = str(body.get("feedback_type") or "thumbs_down").strip() or "thumbs_down"
+    content = str(body.get("content") or "")[:2000]
+
+    recent: List[Dict[str, Any]] = []
+    if session_id_fb is not None:
+        with db_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT role, content, created_at::text AS created_at
+                    FROM business.ai_chat
+                    WHERE session_id = %s
+                    ORDER BY id DESC
+                    LIMIT 10
+                    """,
+                    (session_id_fb,),
+                )
+                rows = list(cur.fetchall() or [])
+                recent = [dict(r) for r in reversed(rows)]
+
+    try:
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO business.ai_feedback
+                        (session_id, user_id, chat_id, feedback_type, content, recent_messages)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        session_id_fb,
+                        user_id_fb,
+                        chat_id_fb,
+                        feedback_type,
+                        content,
+                        Json(recent) if recent else None,
+                    ),
+                )
+            conn.commit()
+    except Exception as e:
+        logger.exception("ai/feedback: %s", e)
+        raise HTTPException(status_code=500, detail="反馈失败") from e
+
+    return {"success": True, "message": "感谢反馈，我们会持续改进"}
+
+
+@app.get("/ai/feedback/summary")
+async def feedback_summary(days: int = Query(1, ge=1, le=365)):
+    """近 N 天的 incidents / feedback 汇总（运维查看）。"""
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT stage, COUNT(*)::bigint AS count
+                FROM business.ai_incidents
+                WHERE created_at >= NOW() - (%s::integer * INTERVAL '1 day')
+                GROUP BY stage
+                ORDER BY count DESC
+                """,
+                (days,),
+            )
+            incidents = [dict(r) for r in cur.fetchall() or []]
+            cur.execute(
+                """
+                SELECT feedback_type, COUNT(*)::bigint AS count
+                FROM business.ai_feedback
+                WHERE created_at >= NOW() - (%s::integer * INTERVAL '1 day')
+                GROUP BY feedback_type
+                ORDER BY count DESC
+                """,
+                (days,),
+            )
+            feedbacks = [dict(r) for r in cur.fetchall() or []]
+            cur.execute(
+                """
+                SELECT COUNT(DISTINCT session_id)::bigint AS total
+                FROM business.ai_chat
+                WHERE created_at >= NOW() - (%s::integer * INTERVAL '1 day')
+                """,
+                (days,),
+            )
+            row = cur.fetchone()
+            total_sessions = int(row["total"]) if row and row.get("total") is not None else 0
+    return {
+        "period": f"最近 {days} 天",
+        "total_sessions": total_sessions,
+        "incidents": incidents,
+        "feedbacks": feedbacks,
+    }
 
 
 @app.post("/ai/memory/clean-session")
@@ -1968,6 +2547,18 @@ async def ai_chat(req: ChatRequest, request: Request):
                     if len(recent_tool_blocks) >= 3:
                         t3 = recent_tool_blocks[-3:]
                         if t3[0] == t3[1] == t3[2]:
+                            log_incident(
+                                stage="expert",
+                                error_message=_ORCH_MSG_DUP_TOOL,
+                                session_id=session_id,
+                                user_id=user_id,
+                                user_input=user_msg_for_log,
+                                context={
+                                    "spin": True,
+                                    "action": current_ai[0],
+                                    "intent": current_ai[1],
+                                },
+                            )
                             yield _sse_line(
                                 {
                                     "type": "delta",
@@ -1982,7 +2573,9 @@ async def ai_chat(req: ChatRequest, request: Request):
 
                     yield _sse_line({"type": "delta", "text": _SSE_TOOL_PLEASE_WAIT})
 
-                    result = await _call_tool_expert(tool_block)
+                    result = await _call_tool_expert(
+                        tool_block, user_id, session_id=session_id
+                    )
 
                     if _is_write_preview_result(result):
                         result_text = _format_tool_result(tool_block, result)
@@ -2028,6 +2621,14 @@ async def ai_chat(req: ChatRequest, request: Request):
                     work_msgs.append({"role": "user", "content": result_text})
 
                 else:
+                    log_incident(
+                        stage="expert",
+                        error_message=_ORCH_MSG_MAX_ROUNDS,
+                        session_id=session_id,
+                        user_id=user_id,
+                        user_input=user_msg_for_log,
+                        context={"max_orchestrator_rounds": MAX_ORCHESTRATOR_ROUNDS},
+                    )
                     yield _sse_line(
                         {
                             "type": "delta",
@@ -2105,6 +2706,18 @@ async def ai_chat(req: ChatRequest, request: Request):
             if len(recent_tool_blocks_ns) >= 3:
                 t3 = recent_tool_blocks_ns[-3:]
                 if t3[0] == t3[1] == t3[2]:
+                    log_incident(
+                        stage="expert",
+                        error_message=_ORCH_MSG_DUP_TOOL,
+                        session_id=session_id,
+                        user_id=user_id,
+                        user_input=user_msg_for_log,
+                        context={
+                            "spin": True,
+                            "action": cur_ai[0],
+                            "intent": cur_ai[1],
+                        },
+                    )
                     reply = assistant_user_visible + "\n\n" + _ORCH_MSG_DUP_TOOL
                     if user_id is not None and session_id is not None:
                         _insert_ai_chat_row(
@@ -2112,7 +2725,9 @@ async def ai_chat(req: ChatRequest, request: Request):
                         )
                     break
 
-            result = await _call_tool_expert(tool_block)
+            result = await _call_tool_expert(
+                tool_block, user_id, session_id=session_id
+            )
 
             if _is_write_preview_result(result):
                 result_text = _format_tool_result(tool_block, result)
@@ -2135,6 +2750,14 @@ async def ai_chat(req: ChatRequest, request: Request):
             work_msgs.append({"role": "assistant", "content": logged_reply})
             work_msgs.append({"role": "user", "content": result_text})
         else:
+            log_incident(
+                stage="expert",
+                error_message=_ORCH_MSG_MAX_ROUNDS,
+                session_id=session_id,
+                user_id=user_id,
+                user_input=user_msg_for_log,
+                context={"max_orchestrator_rounds": MAX_ORCHESTRATOR_ROUNDS},
+            )
             sep = "\n\n" if reply else ""
             reply = (reply or "") + sep + _ORCH_MSG_MAX_ROUNDS
             if user_id is not None and session_id is not None:

@@ -7,9 +7,18 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
+
+# 拥有全表权限的角色（与 meta.role_permissions 中 admin 种子一致；含历史 super_admin）
+_PRIVILEGED_ROLES = frozenset({"admin", "super_admin"})
+
+# INSERT 成功后需自动建审批单的业务表 → meta.approval_rules.target_type
+_TABLE_TO_APPROVAL_TARGET: Dict[str, str] = {
+    "business.contracts": "contract",
+    "business.purchase_orders": "purchase_order",
+}
 
 import sqlparse
 from sqlparse.sql import Statement
@@ -17,6 +26,8 @@ from sqlparse.sql import Statement
 from psycopg2.extras import RealDictCursor
 
 from tools.database import db_conn
+
+from engine.incident_logger import is_audit_permission_only, log_incident
 
 
 def _cursor_execute(cur, sql: str, params: List[Any]) -> None:
@@ -70,6 +81,214 @@ def _load_table_whitelist(cur) -> Set[str]:
         """
     )
     return {r[0] for r in cur.fetchall()}
+
+
+def _get_user_roles(conn, user_id: int) -> List[str]:
+    """由 employees.id 解析账号角色（business.user_role_grants）。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT rg.role_code
+            FROM business.user_role_grants rg
+            JOIN business.user_accounts ua ON ua.id = rg.user_account_id
+            WHERE ua.employee_id = %s AND ua.is_active = true
+            """,
+            (user_id,),
+        )
+        return [str(r[0]) for r in cur.fetchall() if r and r[0]]
+
+
+def _check_table_permission(
+    conn,
+    user_id: Optional[int],
+    roles: List[str],
+    table_name: str,
+    action: str,
+) -> Tuple[bool, str]:
+    """
+    表级权限：read / write / delete。
+    优先级：admin/super_admin → user_permissions（个人覆盖）→ role_permissions。
+    个人覆盖有记录时仅按该记录判定，不再合并角色。
+    """
+    if any(r in _PRIVILEGED_ROLES for r in roles):
+        return True, ""
+    tn = (table_name or "").strip().lower()
+    if "." not in tn:
+        tn = f"business.{tn}"
+    col_map = {"read": "can_read", "write": "can_write", "delete": "can_delete"}
+    col = col_map.get(action)
+    if not col:
+        return False, f"未知操作类型：{action}"
+
+    if user_id is not None:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT {col}
+                FROM business.user_permissions
+                WHERE employee_id = %s AND LOWER(table_name) = %s AND deleted_at IS NULL
+                LIMIT 1
+                """,
+                (int(user_id), tn),
+            )
+            row = cur.fetchone()
+            if row is not None:
+                allowed = row[0]
+                if allowed:
+                    return True, ""
+                return False, f"权限不足：你对 {tn} 没有 {action} 权限"
+
+    if not roles:
+        return False, "权限不足：账号未分配角色"
+
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT 1 FROM meta.role_permissions
+            WHERE role_code = ANY(%s)
+              AND LOWER(table_name) = %s
+              AND {col} = true
+            LIMIT 1
+            """,
+            (roles, tn),
+        )
+        if cur.fetchone():
+            return True, ""
+    return False, f"权限不足：当前角色不允许对 {tn} 执行 {action}"
+
+
+def user_can_read_table(conn, user_id: int, table_name: str) -> bool:
+    """供菜单等：当前用户是否对表有读权限（含个人覆盖）。"""
+    roles = _get_user_roles(conn, int(user_id))
+    ok, _ = _check_table_permission(conn, user_id, roles, table_name, "read")
+    return ok
+
+
+def _audit_r7(
+    conn,
+    user_id: Optional[int],
+    stype: str,
+    all_tables: Set[str],
+    write_targets: Set[str],
+) -> Optional[str]:
+    """R7：表级角色权限。user_id 为 None 时跳过（兼容旧调用）。"""
+    if user_id is None:
+        return None
+    roles = _get_user_roles(conn, int(user_id))
+    if any(r in _PRIVILEGED_ROLES for r in roles):
+        return None
+    st = (stype or "").upper()
+    if st == "SELECT":
+        for t in sorted(all_tables):
+            ok, reason = _check_table_permission(conn, user_id, roles, t, "read")
+            if not ok:
+                return reason
+        return None
+    if st == "INSERT":
+        for t in write_targets:
+            ok, reason = _check_table_permission(conn, user_id, roles, t, "write")
+            if not ok:
+                return reason
+        return None
+    if st == "UPDATE":
+        wt = set(write_targets)
+        for t in all_tables:
+            act = "write" if t in wt else "read"
+            ok, reason = _check_table_permission(conn, user_id, roles, t, act)
+            if not ok:
+                return reason
+        return None
+    if st == "DELETE":
+        for t in write_targets:
+            ok, reason = _check_table_permission(conn, user_id, roles, t, "delete")
+            if not ok:
+                return reason
+        return None
+    return None
+
+
+def _generate_approval_no(cur) -> str:
+    cur.execute("SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY')")
+    year = str(cur.fetchone()[0])
+    cur.execute(
+        "SELECT COUNT(*) FROM business.approvals WHERE approval_no LIKE %s",
+        (f"AP-{year}-%",),
+    )
+    n = (cur.fetchone()[0] or 0) + 1
+    return f"AP-{year}-{n:04d}"
+
+
+def _maybe_create_approval(
+    conn,
+    user_id: int,
+    operation: str,
+    table: Optional[str],
+    returning: Optional[Dict[str, Any]],
+) -> None:
+    """INSERT business.contracts / purchase_orders 成功后：置 pending_approval 并写 business.approvals。"""
+    if operation != "insert" or not returning:
+        return
+    tid = returning.get("id")
+    if tid is None:
+        return
+    t = (table or "").strip().lower()
+    target_type = _TABLE_TO_APPROVAL_TARGET.get(t)
+    if not target_type:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT approver_role FROM meta.approval_rules
+            WHERE target_type = %s AND is_active = true
+              AND (condition_expr IS NULL OR TRIM(condition_expr) = '')
+            LIMIT 1
+            """,
+            (target_type,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return
+        approver_role = row[0]
+        cur.execute(
+            """
+            SELECT ua.employee_id FROM business.user_role_grants rg
+            JOIN business.user_accounts ua ON ua.id = rg.user_account_id
+            WHERE rg.role_code = %s AND ua.is_active = true
+              AND ua.employee_id IS NOT NULL
+            LIMIT 1
+            """,
+            (approver_role,),
+        )
+        r2 = cur.fetchone()
+        approver_id = int(r2[0]) if r2 and r2[0] is not None else None
+
+        target_no = None
+        if "contract_no" in returning and returning.get("contract_no") is not None:
+            target_no = str(returning.get("contract_no"))
+        elif "po_no" in returning and returning.get("po_no") is not None:
+            target_no = str(returning.get("po_no"))
+
+        approval_no = _generate_approval_no(cur)
+
+        if t == "business.contracts":
+            cur.execute(
+                "UPDATE business.contracts SET status = 'pending_approval' WHERE id = %s",
+                (tid,),
+            )
+        elif t == "business.purchase_orders":
+            cur.execute(
+                "UPDATE business.purchase_orders SET status = 'pending_approval' WHERE id = %s",
+                (tid,),
+            )
+
+        cur.execute(
+            """
+            INSERT INTO business.approvals
+                (approval_no, target_type, target_id, target_no, requested_by, approver_id, status)
+            VALUES (%s, %s, %s, %s, %s, %s, 'pending')
+            """,
+            (approval_no, target_type, int(tid), target_no, user_id, approver_id),
+        )
 
 
 def _get_table_cn(full_table: str, cur) -> Optional[str]:
@@ -286,9 +505,9 @@ def _audit_sql_confirm_r1_r4(sql: str) -> Dict[str, Any]:
     return {"passed": True, "reason": "", "statement_type": stype, "target_table": target}
 
 
-def _audit_sql(sql: str, conn) -> Dict[str, Any]:
+def _audit_sql(sql: str, conn, user_id: Optional[int] = None) -> Dict[str, Any]:
     """
-    完整审计 R1–R6（preview / execute_sql 用）。
+    完整审计 R1–R7（preview / execute_sql 用）；R7 需 user_id，为 None 时跳过。
     返回 passed, reason, statement_type, target_table (schema.table 小写)。
     """
     if not sql or not isinstance(sql, str):
@@ -350,8 +569,19 @@ def _audit_sql(sql: str, conn) -> Dict[str, Any]:
     if stype == "SELECT":
         if not all_tables:
             if not re.search(r"\bFROM\b", bare, re.IGNORECASE):
+                r7 = _audit_r7(conn, user_id, stype, all_tables, set())
+                if r7:
+                    return {
+                        "passed": False,
+                        "reason": r7,
+                        "statement_type": stype,
+                        "target_table": None,
+                    }
                 return {"passed": True, "reason": "", "statement_type": stype, "target_table": None}
             return {"passed": False, "reason": "未能识别 SELECT 涉及的表", "statement_type": stype, "target_table": None}
+        r7 = _audit_r7(conn, user_id, stype, all_tables, set())
+        if r7:
+            return {"passed": False, "reason": r7, "statement_type": stype, "target_table": None}
         return {"passed": True, "reason": "", "statement_type": stype, "target_table": None}
 
     if stype in ("INSERT", "UPDATE", "DELETE"):
@@ -377,6 +607,10 @@ def _audit_sql(sql: str, conn) -> Dict[str, Any]:
         if stype in ("UPDATE", "DELETE"):
             if not re.search(r"\bWHERE\b", one, re.IGNORECASE):
                 return {"passed": False, "reason": f"{stype} 必须包含 WHERE 条件", "statement_type": stype, "target_table": target}
+
+        r7 = _audit_r7(conn, user_id, stype, all_tables, write_targets)
+        if r7:
+            return {"passed": False, "reason": r7, "statement_type": stype, "target_table": target}
 
         return {"passed": True, "reason": "", "statement_type": stype, "target_table": target}
 
@@ -588,6 +822,7 @@ def execute_sql(
     sql: str,
     params: Optional[list] = None,
     conn=None,
+    user_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     审计并执行 SELECT（仅 SELECT；EXPLAIN SELECT 按 SELECT 审计并执行）。
@@ -595,10 +830,18 @@ def execute_sql(
     params = list(params or [])
 
     def _run(c) -> Dict[str, Any]:
-        audit = _audit_sql(sql, c)
+        audit = _audit_sql(sql, c, user_id)
         if not audit["passed"]:
             reason = audit["reason"]
             logger.warning("execute_sql: 审计未通过: %s | sql=%r", reason, sql[:500])
+            if not is_audit_permission_only(reason):
+                log_incident(
+                    stage="audit",
+                    error_message=reason,
+                    user_id=user_id,
+                    generated_sql=sql,
+                    context={"fn": "execute_sql"},
+                )
             return {"success": False, "error": reason}
         st = audit["statement_type"]
         if st != "SELECT":
@@ -619,6 +862,13 @@ def execute_sql(
             }
         except Exception as e:
             logger.warning("execute_sql: 数据库执行异常: %s | sql=%r", e, sql[:500])
+            log_incident(
+                stage="execute",
+                error_message=str(e),
+                user_id=user_id,
+                generated_sql=sql,
+                context={"fn": "execute_sql"},
+            )
             return {"success": False, "error": str(e)}
 
     if conn is not None:
@@ -631,15 +881,24 @@ def preview_sql(
     sql: str,
     params: Optional[list] = None,
     conn=None,
+    user_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """审计写 SQL，不执行，生成摘要。"""
     params = list(params or [])
 
     def _run(c) -> Dict[str, Any]:
-        audit = _audit_sql(sql, c)
+        audit = _audit_sql(sql, c, user_id)
         if not audit["passed"]:
             reason = audit["reason"]
             logger.warning("preview_sql: 审计未通过: %s | sql=%r", reason, sql[:500])
+            if not is_audit_permission_only(reason):
+                log_incident(
+                    stage="audit",
+                    error_message=reason,
+                    user_id=user_id,
+                    generated_sql=sql,
+                    context={"fn": "preview_sql"},
+                )
             return {"success": False, "error": reason}
         st = audit["statement_type"]
         if st == "SELECT":
@@ -668,17 +927,27 @@ def preview_sql(
         return _run(c)
 
 
-def _confirm_write_single(conn, sql: str, params: List[Any]) -> Dict[str, Any]:
+def _confirm_write_single(
+    conn, sql: str, params: List[Any], user_id: Optional[int] = None
+) -> Dict[str, Any]:
     """
     审计并执行一条写 SQL，不 commit / rollback（由调用方在事务末统一处理）。
-    确认前仅 R1–R4。
+    确认前完整审计 R1–R7（与 preview 一致）；INSERT 合同/采购订单后可能写审批单。
     """
     sql = (sql or "").strip()
     params = list(params or [])
-    audit = _audit_sql_confirm_r1_r4(sql)
+    audit = _audit_sql(sql, conn, user_id)
     if not audit["passed"]:
         reason = audit["reason"]
         logger.warning("confirm_execute_sql: 审计未通过: %s | sql=%r", reason, sql[:500])
+        if not is_audit_permission_only(reason):
+            log_incident(
+                stage="audit",
+                error_message=reason,
+                user_id=user_id,
+                generated_sql=sql,
+                context={"fn": "_confirm_write_single"},
+            )
         return {"success": False, "error": reason}
     st = audit["statement_type"]
     if st == "SELECT":
@@ -698,6 +967,14 @@ def _confirm_write_single(conn, sql: str, params: List[Any]) -> Dict[str, Any]:
         rid = None
         if returning_row and "id" in returning_row:
             rid = returning_row["id"]
+        if user_id is not None:
+            _maybe_create_approval(
+                conn,
+                int(user_id),
+                st.lower(),
+                audit.get("target_table"),
+                returning_row,
+            )
         return {
             "success": True,
             "affected_rows": affected,
@@ -707,10 +984,19 @@ def _confirm_write_single(conn, sql: str, params: List[Any]) -> Dict[str, Any]:
             "id": rid,
         }
     except Exception as e:
+        log_incident(
+            stage="execute",
+            error_message=str(e),
+            user_id=user_id,
+            generated_sql=sql,
+            context={"fn": "_confirm_write_single"},
+        )
         return {"success": False, "error": str(e)}
 
 
-def confirm_batch_sql(items: List[Dict[str, Any]], conn) -> Dict[str, Any]:
+def confirm_batch_sql(
+    items: List[Dict[str, Any]], conn, user_id: Optional[int] = None
+) -> Dict[str, Any]:
     """
     顺序执行多条写 SQL（均已通过 preview），同一连接内一次 commit。
     items: [{"sql": str, "params": []}, ...]
@@ -727,7 +1013,7 @@ def confirm_batch_sql(items: List[Dict[str, Any]], conn) -> Dict[str, Any]:
                 "results": results,
                 "failed_index": i,
             }
-        r = _confirm_write_single(conn, sql, params)
+        r = _confirm_write_single(conn, sql, params, user_id)
         if not r.get("success"):
             conn.rollback()
             return {**r, "results": results, "failed_index": i}
@@ -737,6 +1023,12 @@ def confirm_batch_sql(items: List[Dict[str, Any]], conn) -> Dict[str, Any]:
     except Exception as e:
         conn.rollback()
         logger.exception("confirm_batch_sql commit: %s", e)
+        log_incident(
+            stage="execute",
+            error_message=str(e),
+            user_id=user_id,
+            context={"fn": "confirm_batch_sql", "phase": "commit"},
+        )
         return {"success": False, "error": str(e), "results": results}
     return {"success": True, "results": results, "count": len(results)}
 
@@ -779,14 +1071,19 @@ def verify_confirmed_writes(
     return {"ok": True, "reason": ""}
 
 
-def confirm_execute_sql(sql: str, params: Optional[list] = None, conn=None) -> Dict[str, Any]:
+def confirm_execute_sql(
+    sql: str,
+    params: Optional[list] = None,
+    conn=None,
+    user_id: Optional[int] = None,
+) -> Dict[str, Any]:
     """
     用户确认后执行写 SQL：再次审计（R1–R4）并执行，INSERT 建议带 RETURNING id。
     """
     params = list(params or [])
 
     def _run(c) -> Dict[str, Any]:
-        r = _confirm_write_single(c, sql, params)
+        r = _confirm_write_single(c, sql, params, user_id)
         if r.get("success"):
             try:
                 c.commit()

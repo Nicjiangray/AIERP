@@ -22,11 +22,6 @@
 
     <div class="menu-section">
       <div class="section-label mono">数据</div>
-      <router-link to="/meta" class="menu-item" active-class="active">
-        <span class="icon">◫</span>
-        <span>元数据</span>
-        <span class="badge">{{ metaCount }}</span>
-      </router-link>
       <router-link to="/business" class="menu-item" active-class="active">
         <span class="icon">◪</span>
         <span>业务数据</span>
@@ -59,7 +54,6 @@ onMounted(async () => {
   }
 })
 
-const metaCount = computed(() => store.tables.meta.length)
 const bizCount = computed(() => store.tables.business.length)
 </script>
 

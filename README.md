@@ -139,15 +139,81 @@
 
 ---
 
+### V7：权限体系 + 审批流 + 仪表盘 + 测试反馈（2026-04）
+
+**Schema Shadow 压缩**
+
+- `scripts/sync_schema_shadow.py` 输出格式从 JSON 改为紧凑纯文本（`!` 必填、`→` 外键、缩进字段行）
+- 公共字段（id, status, notes, created_at, updated_at, deleted_at）声明一次不重复
+- 体积从约 7000 token 压缩到约 1500 token
+
+**权限管理**
+
+- **角色表级权限**：`meta.role_permissions`（role_code → table_name → can_read/write/delete）；`sql_engine.py` 新增 R7 规则
+- **个人权限覆盖**：`business.user_permissions`（employee_id → table_name），优先级高于角色默认；支持加权和减权
+- **主管数据可见**：`employees.manager_id` + prompt 注入下属列表和 `owner_id IN (...)` 条件
+- **动态菜单**：`GET /api/user-menu?user_id=`，合并个人+角色权限，前端 DataNavPanel 改用此接口驱动
+- **业务表 owner_id**：`customers`、`contracts`、`purchase_orders`、`shipping_notes` 新增 `owner_id`
+- 4 个角色：admin / sales / warehouse / finance，权限矩阵见 `meta.role_permissions` 种子数据
+
+**审批流**
+
+- `business.approvals`：审批记录（target_type、target_id、requested_by、approver_id、status、comment）
+- `meta.approval_rules`：审批规则配置（target_type → approver_role）
+- 合同和采购订单 INSERT 成功后自动创建审批记录，status 设为 `pending_approval`
+- `GET /approvals/pending?user_id=` + `POST /approvals/{id}/decide`
+- 审批通过后统一设为 `active`，下游只认 `active` 状态
+
+**Meta Schema 屏蔽**
+
+- `/table/{schema}` 等路由硬编码拒绝 `schema=meta`（403）
+- `/nav/tables`、`/tables`、`/table-columns` 过滤 meta 表
+- 前端 `/meta`、`/meta/:table` 路由重定向 `/dashboard`，NavPanel 移除元数据入口
+- 无开关、无配置，设计者直接 psql
+
+**仪表盘**
+
+- `business.dashboard_cards`：卡片配置（title、card_type、query_sql、card_config JSONB）
+- 5 种图表：number / bar / pie / line / list
+- 查询优先级：个人卡片（employee_id）→ 角色默认（role_code）
+- SQL 中 `:user_id` 占位符，执行时替换；所有 SQL 走 `execute_sql` R1–R7 审计
+- `GET /api/dashboard?user_id=`
+- 前端 ECharts + vue-echarts，5 个图表组件
+
+**助手自我介绍**
+
+- `role_rules` 追加自我介绍规则
+- 前端空白状态展示欢迎语（不写入 ai_chat）
+
+**测试反馈收集**
+
+- `business.ai_incidents`：系统错误自动采集（stage / user_input / generated_sql / error_message）；`engine/incident_logger.py` 在各 except 块埋点
+- `business.ai_feedback`：用户👎反馈 + 对话上下文快照；`POST /ai/feedback` + `GET /ai/feedback/summary`
+- `scripts/daily_report.py`：每日汇总报告
+- 这两张表 `include_in_domain_model = false`，expert 不可见
+
+**相关迁移**
+
+| 文件 | 作用 |
+|------|------|
+| `v17_permission_and_approval.sql` | 角色权限 + 审批规则 + 审批表 + owner_id + 种子数据 |
+| `v18_user_permissions_and_menu.sql` | 个人权限覆盖 + manager_id 外键 |
+| `v19_dashboard_cards.sql` | 仪表盘卡片 + 种子数据 |
+| `v20_role_rules_self_intro.sql` | 自我介绍 prompt |
+| `v21_role_rules_self_intro_wording.sql` | 自我介绍措辞修订（可选） |
+| `v22_incidents_and_feedback.sql` | 错误采集 + 用户反馈 |
+
+---
+
 ## 项目目录结构概览
 
 ```
 aierp/
-├── main.py                 # FastAPI：表 CRUD、/auth/*、/ai/chat（orchestrator+[TOOL]）、/ai/chat/log-message、/ai/memory/*、/ai/confirm
-├── engine/                 # sql_engine、prompt_builder、memory_manager；query/write_engine 已 deprecated
+├── main.py                 # FastAPI：表 CRUD、/auth/*、/api/user-menu、/api/dashboard、/approvals/*、/ai/chat（orchestrator+[TOOL]）、/ai/chat/log-message、/ai/memory/*、/ai/confirm、/ai/feedback*
+├── engine/                 # sql_engine、prompt_builder、memory_manager、incident_logger；query/write_engine 已 deprecated
 ├── llm/                    # OpenAI 兼容客户端（chat / 流式 / 附件解析）；intent 为占位
 ├── tools/                  # 连接池、通用 DB 读写与会话 memo 等辅助
-├── scripts/                # sync_meta_pipeline、sync_meta_cn、sync_schema_shadow
+├── scripts/                # sync_meta_pipeline、sync_meta_cn、sync_schema_shadow、daily_report
 ├── constitution/           # SQL 迁移与种子（表结构、prompts、ai_memory 等）
 ├── frontend/               # Vue 3 + Vite（入口见下方说明）
 │   ├── index.html          # 挂载 /src/main.js
@@ -178,6 +244,7 @@ aierp/
 | `write_engine.py` | 旧版：结构化 payload 的预览与写入 | **deprecated**：同上 |
 | `prompt_builder.py` | 统一 prompt 拼装：按 `agent_role` 取 `meta.prompts` + 按 `user_id` 取 `ai_memory` | **已完成**：`assistant` / `tool_expert` / `memory_manager` |
 | `memory_manager.py` | 记忆管理员：`clean_session()`、`compress_longterm()` | **已完成**：手动 API 触发 |
+| `incident_logger.py` | 系统错误记录：`log_incident()` | **已完成**：在 `sql_engine` / `main.py` 各 except 块调用 |
 
 ---
 
@@ -209,6 +276,12 @@ aierp/
 | `/ai/memory` | POST | 新增一条 `core` 或 `longterm`：`{ user_id, scope, content }` | 可用 |
 | `/ai/memory/{id}` | PATCH | 更新内容：`{ user_id, content }`（仅 `core`/`longterm`） | 可用 |
 | `/ai/memory/{id}` | DELETE | `?user_id=` 与记录一致时删除 | 可用 |
+| `/api/user-menu` | GET | 当前用户可见菜单（个人+角色权限合并） | 可用 |
+| `/api/dashboard` | GET | 仪表盘数据（执行卡片 SQL 返回结果） | 可用 |
+| `/approvals/pending` | GET | 当前用户待审批列表 | 可用 |
+| `/approvals/{id}/decide` | POST | 审批决定（approved/rejected） | 可用 |
+| `/ai/feedback` | POST | 提交用户反馈 | 可用 |
+| `/ai/feedback/summary` | GET | 反馈摘要（开发者用） | 可用 |
 | `/ai/chat`（`pendingToken`） | POST | — | **未联通**：显式返回 400，提示不支持恢复 |
 | `/ai/chat`（`confirm: true`） | POST | — | **未联通**：显式返回 400，提示不在此确认 DB |
 
@@ -225,15 +298,16 @@ aierp/
 | `App.vue` | **`n-config-provider` 包裹**；**未登录**仅 **`LoginView`**；**已登录**为 `NavPanel` + `RouterView` + `AiPanel`；`onMounted` 调用 **`auth.restoreSession()`** | 可用 |
 | **`views/LoginView.vue`** | **登录页**：登录名 + 密码 → **`POST /auth/login`** | 可用 |
 | **`stores/auth.js`** | **`currentUser`**、`login` / `logout` / **`restoreSession`**（`localStorage`：`aierp_user_id`） | 可用 |
-| `router/index.js` | `/dashboard`、`/meta`、`/business`、`/meta/:table`、`/business/:table`、`/ai-rules` | 可用（登录页不走路由，由 `App.vue` 条件渲染） |
-| `stores/app.js` | 请求 `http://localhost:8000` 的 `/tables`、`/nav/tables`、`/table-columns`、`/table/...`、导出 URL、表 CRUD | 可用 |
-| `components/NavPanel.vue` | 侧栏导航；**展示当前用户名 + 退出** | 可用 |
-| `components/DataNavPanel.vue` | 数据侧导航（与表拆分配置配合） | 可用 |
-| `components/AiPanel.vue` | AI 对话：SSE **`/ai/chat`**、**`/ai/confirm`**；加载中可 **「终止」** 中断 SSE；请求体 **`user_id` 取自 `useAuthStore().currentUser?.id`**（与登录态一致） | 可用 |
-| `views/DashboardView.vue` | 仪表盘占位 | 可用 |
-| `views/MetaView.vue` / `BusinessView.vue` | 元数据/业务表列表入口 | 可用 |
+| `router/index.js` | `/dashboard`、`/business`、`/business/:table`、`/memory`、`/ai-rules`；**`/meta`、`/meta/:table` 重定向 `/dashboard`** | 可用（登录页不走路由，由 `App.vue` 条件渲染） |
+| `stores/app.js` | 请求 `http://localhost:8000` 的 `/tables`、`/nav/tables`、`/table-columns`、`/table/...`、导出 URL、表 CRUD；登录后 **`fetchUserMenu`**（`/api/user-menu`） | 可用 |
+| `components/NavPanel.vue` | 侧栏导航；**展示当前用户名 + 退出**；快捷链接 **仪表盘 / 记忆**（无元数据入口、无侧栏「AI 规则」） | 可用 |
+| `components/DataNavPanel.vue` | 数据侧导航：**`GET /api/user-menu`** 驱动可见表（个人+角色权限合并） | 可用 |
+| `components/AiPanel.vue` | AI 对话：SSE **`/ai/chat`**、**`/ai/confirm`**；加载中可 **「终止」** 中断 SSE；**空白欢迎语（不入库）** + **👎 反馈** → **`POST /ai/feedback`**；请求体 **`user_id` 取自 `useAuthStore().currentUser?.id`** | 可用 |
+| `views/DashboardView.vue` | **动态仪表盘**（ECharts / vue-echarts，卡片数据来自 **`/api/dashboard`**） | 可用 |
+| `components/dashboard/*.vue` | 图表组件：**NumberCard** / **BarCard** / **PieCard** / **LineCard** / **ListCard** | 可用 |
+| `views/MetaView.vue` / `BusinessView.vue` | 元数据/业务表列表入口（**`/meta` 已重定向仪表盘**，一般不从路由进入） | 可用 |
 | `views/TableView.vue` | 通用表浏览与编辑 | 可用 |
-| `views/AiRulesView.vue` | 展示 `meta.ai_rules` 表数据 | 可用 |
+| `views/AiRulesView.vue` | `/ai-rules` 占位说明：**`meta.ai_rules` 请用 psql 维护**，无表数据请求 | 可用 |
 | `views/MemoryView.vue` | **记忆管理**：`core` / `longterm` 查看与增删改（`/ai/memory`） | 可用 |
 | `config/tableSplit.js` | 表拆分配置 | 可用 |
 | `utils/tableExport.js` | 导出 xlsx URL 构造 | 可用 |
@@ -322,6 +396,12 @@ aierp/
 | **`v13_role_rules_multistep_orchestrator.sql`** | **V6**：`role_rules` 多步骤任务与征得同意 |
 | **`v14_ai_memory_scope_core_and_prompt.sql`** | **V6**：`ai_memory.scope` 增加 **`core`**；`meta.prompts` 插入 **`memory_core_extract`** |
 | **`v15_comment_new_tables.sql`** | **V6**：新建十张业务表及若干新增列的 **COMMENT ON TABLE/COLUMN**（中文）；末尾 **`CALL meta.sync_constitution()`** |
+| **`v17_permission_and_approval.sql`** | **V7**：角色权限 + 审批规则 + 审批表 + `owner_id` + 种子数据 |
+| **`v18_user_permissions_and_menu.sql`** | **V7**：个人权限覆盖 + `manager_id` 外键 |
+| **`v19_dashboard_cards.sql`** | **V7**：仪表盘卡片表 + 种子数据 |
+| **`v20_role_rules_self_intro.sql`** | **V7**：`role_rules` 追加自我介绍 |
+| **`v21_role_rules_self_intro_wording.sql`** | **V7**：自我介绍措辞修订（可选） |
+| **`v22_incidents_and_feedback.sql`** | **V7**：`ai_incidents` + `ai_feedback`，`include_in_domain_model=false` |
 
 执行示例：
 
@@ -338,6 +418,13 @@ psql -U nicjiang -d aierp -f constitution/create_meta_prompts.sql
 - **`meta.prompts`**：所有注入 LLM 的提示词模块；字段 **`agent_role`** 区分归属。`inject_mode`：`always` = 拼装进 `build_prompt(agent_role)`，`on_demand` = 仅 `build_prompt_on_demand(prompt_code)`（如记忆清洗/压缩脚本）。
 - **`business.ai_memory`**：用户级 AI 记忆（`scope`：`session` / `longterm`），`source_session_id` 可选指向 **`business.ai_sessions`**。
 - **`business.ai_sessions` / `business.ai_chat`**：对话会话与消息原文；持久化由 `/ai/chat` 在提供 `user_id` 时写入。
+- **`meta.role_permissions`**：角色→表级权限矩阵，**R7** 校验用。
+- **`business.user_permissions`**：个人级权限覆盖，优先于角色默认。
+- **`meta.approval_rules`**：审批规则配置（`target_type` → `approver_role`）。
+- **`business.approvals`**：审批记录。
+- **`business.dashboard_cards`**：仪表盘卡片配置，存 SQL，前端经 **`/api/dashboard`** 由引擎执行。
+- **`business.ai_incidents`**：系统错误自动记录（`include_in_domain_model=false`，expert 不可见）。
+- **`business.ai_feedback`**：用户反馈（`include_in_domain_model=false`，expert 不可见）。
 
 **`agent_role` 与典型 prompt 条目（V5 之后）**
 
@@ -361,3 +448,4 @@ psql -U nicjiang -d aierp -f constitution/create_meta_prompts.sql
 
 - `scripts/sync_schema_shadow.py`：单独生成 schema 影子（紧凑文本）到 `meta.prompts`
 - `scripts/sync_meta_cn.py`：单独补字段中文名
+- `scripts/daily_report.py`：每日测试摘要（`ai_incidents` + `ai_feedback`），用法 `python scripts/daily_report.py [--days N]`

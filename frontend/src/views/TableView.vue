@@ -113,7 +113,10 @@
 
       <!-- 主从分屏 -->
       <template v-else>
-        <div class="split-pane split-pane--parent">
+        <div
+          class="split-pane split-pane--parent"
+          :style="{ flex: `0 0 ${splitTopPx}px` }"
+        >
           <div class="split-pane-title text-3">
             主表 · {{ tableTitle }}
             <span class="mono split-hint">（点击行以筛选下方子表）</span>
@@ -130,26 +133,38 @@
             />
             <n-button size="tiny" tertiary @click="clearFilters">清空筛选</n-button>
           </div>
-          <n-data-table
-            remote
-            :columns="columns"
-            :data="rows"
-            :row-key="rowKeyFn"
-            :row-props="parentRowProps"
-            :scroll-x="scrollXMin"
-            :max-height="'min(42vh, 360px)'"
-            :bordered="false"
-            :single-line="false"
-            :pagination="pagination"
-            size="small"
-            striped
-            @update:page="onPageChange"
-            @update:page-size="onPageSizeChange"
-            @update:sorter="onUpdateSorter"
-          />
+          <div ref="parentTableScrollWrapRef" class="split-table-scroll">
+            <n-data-table
+              remote
+              :columns="columns"
+              :data="rows"
+              :row-key="rowKeyFn"
+              :row-props="parentRowProps"
+              :scroll-x="scrollXMin"
+              :max-height="parentSplitTableMaxH"
+              :bordered="false"
+              :single-line="false"
+              :pagination="pagination"
+              size="small"
+              striped
+              @update:page="onPageChange"
+              @update:page-size="onPageSizeChange"
+              @update:sorter="onUpdateSorter"
+            />
+          </div>
         </div>
-        <div class="split-divider" />
-        <div class="split-pane split-pane--child" ref="childTableWrapRef">
+        <div
+          class="split-h-handle"
+          role="separator"
+          aria-orientation="horizontal"
+          title="拖动调整主表 / 子表区域高度"
+          @mousedown.prevent="onSplitHorizontalMouseDown"
+        />
+        <div
+          class="split-pane split-pane--child"
+          ref="childTableWrapRef"
+          :style="{ flex: '1 1 auto', minHeight: 0 }"
+        >
           <div class="split-pane-title text-3">
             子表 · {{ childTitle }}
           </div>
@@ -173,23 +188,24 @@
               <n-spin size="small" />
               <span class="text-3">加载子表…</span>
             </div>
-            <n-data-table
-              v-else
-              remote
-              :columns="childColumns"
-              :data="childRows"
-              :row-key="rowKeyFn"
-              :scroll-x="childScrollXMin"
-              :max-height="'min(38vh, 320px)'"
-              :bordered="false"
-              :single-line="false"
-              :pagination="childPagination"
-              size="small"
-              striped
-              @update:page="onChildPageChange"
-              @update:page-size="onChildPageSizeChange"
-              @update:sorter="onChildSorter"
-            />
+            <div v-else ref="childTableScrollWrapRef" class="split-table-scroll">
+              <n-data-table
+                remote
+                :columns="childColumns"
+                :data="childRows"
+                :row-key="rowKeyFn"
+                :scroll-x="childScrollXMin"
+                :max-height="childSplitTableMaxH"
+                :bordered="false"
+                :single-line="false"
+                :pagination="childPagination"
+                size="small"
+                striped
+                @update:page="onChildPageChange"
+                @update:page-size="onChildPageSizeChange"
+                @update:sorter="onChildSorter"
+              />
+            </div>
           </template>
         </div>
       </template>
@@ -253,6 +269,7 @@ import {
   h,
   nextTick,
   onBeforeUnmount,
+  onUnmounted,
   defineComponent,
   toRaw,
   provide,
@@ -260,6 +277,7 @@ import {
 } from 'vue'
 import { useRoute } from 'vue-router'
 import { useAppStore } from '../stores/app'
+import { useAuthStore } from '../stores/auth'
 import { buildExportXlsxUrl } from '../utils/tableExport'
 import { splitConfigForRouteTable } from '../config/tableSplit'
 import Sortable from 'sortablejs'
@@ -341,11 +359,13 @@ const HeaderFilterInput = defineComponent({
 
 const route = useRoute()
 const store = useAppStore()
+const authStore = useAuthStore()
 
 const filterClearGeneration = ref(0)
 provide(FILTER_CLEAR_GEN_KEY, filterClearGeneration)
 
-const schema = computed(() => (route.path.startsWith('/meta') ? 'meta' : 'business'))
+/** 通用表浏览仅保留 business；meta 已屏蔽 */
+const schema = computed(() => 'business')
 const tableName = computed(() => route.params.table)
 
 /** 主从分屏：路由为父表或子表名均可 */
@@ -373,15 +393,24 @@ const globalSearch = ref('')
 /** 列名 → 单列模糊，多列 AND */
 const columnFilters = reactive({})
 
+/**
+ * 主从分屏时主表分页：避免单页行数过多把纵向撑满，导致横向滚动条难达。
+ * 默认 20 条 + id 降序 ≈ 常见自增主键下「最新在前」；可在分页器改 10/50 等。
+ */
+const SPLIT_PARENT_PAGE_SIZE = 20
+const SPLIT_PARENT_PAGE_SIZES = [10, 20, 50, 100, 200]
+const SINGLE_TABLE_PAGE_SIZE = 500
+const SINGLE_TABLE_PAGE_SIZES = [50, 100, 200, 500]
+
 /** 服务端排序 + 分页：与 naive remote 表格联动 */
 const sortBy = ref('id')
 const sortOrder = ref('desc')
 const pagination = reactive({
   page: 1,
-  pageSize: 500,
+  pageSize: SINGLE_TABLE_PAGE_SIZE,
   itemCount: 0,
   showSizePicker: true,
-  pageSizes: [50, 100, 200, 500],
+  pageSizes: [...SINGLE_TABLE_PAGE_SIZES],
 })
 const editSnapshot = ref(null)
 const undoStack = ref([])
@@ -401,6 +430,96 @@ const childPagination = reactive({
 })
 const tableWrapRef = ref(null)
 const childTableWrapRef = ref(null)
+
+/** 主从分屏：上下可拖高度 */
+const splitTopPx = ref(300)
+const splitTopInitializedFor = ref('')
+const parentTableScrollWrapRef = ref(null)
+const childTableScrollWrapRef = ref(null)
+const parentSplitTableMaxH = ref(360)
+const childSplitTableMaxH = ref(280)
+let splitParentRo = null
+let splitChildRo = null
+let splitRootRo = null
+let splitHDrag = null
+
+function clampSplitTop(px, rootH) {
+  const handle = 8
+  const minTop = 120
+  const minBottom = 100
+  if (rootH <= handle + minTop + minBottom) return minTop
+  const maxTop = rootH - handle - minBottom
+  return Math.min(maxTop, Math.max(minTop, Math.round(px)))
+}
+
+function updateSplitScrollHeights() {
+  if (parentTableScrollWrapRef.value) {
+    parentSplitTableMaxH.value = Math.max(80, parentTableScrollWrapRef.value.clientHeight)
+  }
+  if (childTableScrollWrapRef.value) {
+    childSplitTableMaxH.value = Math.max(80, childTableScrollWrapRef.value.clientHeight)
+  }
+}
+
+function unbindSplitObservers() {
+  splitParentRo?.disconnect()
+  splitChildRo?.disconnect()
+  splitRootRo?.disconnect()
+  splitParentRo = null
+  splitChildRo = null
+  splitRootRo = null
+}
+
+function bindSplitObservers() {
+  unbindSplitObservers()
+  if (!splitCfg.value || !tableWrapRef.value) return
+  const root = tableWrapRef.value
+  splitRootRo = new ResizeObserver(() => {
+    updateSplitScrollHeights()
+    splitTopPx.value = clampSplitTop(splitTopPx.value, root.clientHeight)
+  })
+  splitRootRo.observe(root)
+  if (parentTableScrollWrapRef.value) {
+    splitParentRo = new ResizeObserver(() => updateSplitScrollHeights())
+    splitParentRo.observe(parentTableScrollWrapRef.value)
+  }
+  if (childTableScrollWrapRef.value) {
+    splitChildRo = new ResizeObserver(() => updateSplitScrollHeights())
+    splitChildRo.observe(childTableScrollWrapRef.value)
+  }
+}
+
+function onSplitHorizontalMouseDown(e) {
+  if (!tableWrapRef.value) return
+  splitHDrag = { startY: e.clientY, startTopPx: splitTopPx.value }
+  document.body.style.cursor = 'ns-resize'
+  document.body.style.userSelect = 'none'
+  window.addEventListener('mousemove', onSplitHorizontalMove)
+  window.addEventListener('mouseup', onSplitHorizontalUp, { once: true })
+}
+
+function onSplitHorizontalMove(e) {
+  if (!splitHDrag || !tableWrapRef.value) return
+  const root = tableWrapRef.value
+  const delta = e.clientY - splitHDrag.startY
+  splitTopPx.value = clampSplitTop(splitHDrag.startTopPx + delta, root.clientHeight)
+  nextTick(() => updateSplitScrollHeights())
+}
+
+function onSplitHorizontalUp() {
+  splitHDrag = null
+  document.body.style.cursor = ''
+  document.body.style.userSelect = ''
+  window.removeEventListener('mousemove', onSplitHorizontalMove)
+  if (splitCfg.value) {
+    try {
+      const key = `aierp.layout.splitTop.${schema.value}.${displayTable.value}`
+      localStorage.setItem(key, String(splitTopPx.value))
+    } catch {
+      /* ignore */
+    }
+  }
+}
 /** 用户拖拽后的列顺序；null 表示跟随 meta_fields 默认顺序 */
 const manualOrder = ref(null)
 let headerSortable = null
@@ -411,14 +530,18 @@ const tableTitle = computed(() => {
   const n = splitCfg.value ? displayTable.value : tableName.value
   const all = [...store.nav.design, ...store.nav.prep, ...store.nav.run]
   const hit = all.find((t) => t.table_name === n)
-  return hit?.table_cn || n
+  if (hit?.table_cn) return hit.table_cn
+  const cn = store.resolveTableCn(n)
+  return cn || n
 })
 
 const childTitle = computed(() => {
   if (!splitCfg.value) return ''
   const all = [...store.nav.design, ...store.nav.prep, ...store.nav.run]
   const hit = all.find((t) => t.table_name === childTable.value)
-  return hit?.table_cn || childTable.value
+  if (hit?.table_cn) return hit.table_cn
+  const cn = store.resolveTableCn(childTable.value)
+  return cn || childTable.value
 })
 
 const splitHeadline = computed(() => {
@@ -458,6 +581,41 @@ const effectiveDataKeys = computed(() =>
   mergeColumnOrder(manualOrder.value, orderedFieldKeys.value)
 )
 
+/** 列表展示用：隐藏 id / 外键 *_id 等系统字段，保留日期时间列 */
+function shouldHideGridField(key, defs) {
+  const meta = defs?.find((d) => d.field_name === key)
+  const dt = (meta?.data_type || '').toLowerCase()
+  if (
+    dt.includes('timestamp') ||
+    dt.includes('date') ||
+    (dt.includes('time') && !dt.includes('interval'))
+  ) {
+    return false
+  }
+  const k = key.toLowerCase()
+  if (/_at$/.test(k)) return false
+  if (k.includes('date') || k.includes('time')) return false
+
+  if (k === 'id') return true
+  if (k.endsWith('_id')) return true
+  const block = new Set([
+    'template_id',
+    'version',
+    'sort_order',
+    'nav_order',
+    'embedding',
+    'password_hash',
+    'is_deleted',
+  ])
+  if (block.has(k)) return true
+  if (k.startsWith('embedding') || k.startsWith('intent_embedding')) return true
+  return false
+}
+
+const gridDisplayKeys = computed(() =>
+  effectiveDataKeys.value.filter((k) => !shouldHideGridField(k, colDefs.value))
+)
+
 const childOrderedFieldKeys = computed(() => {
   const defs = childColDefs.value
   const fromMeta = defs.map((d) => d.field_name)
@@ -467,6 +625,12 @@ const childOrderedFieldKeys = computed(() => {
   if (fromMeta.length) return [...fromMeta, ...extra]
   return fromRows.sort()
 })
+
+const childGridDisplayKeys = computed(() =>
+  childOrderedFieldKeys.value.filter((k) =>
+    !shouldHideGridField(k, childColDefs.value)
+  )
+)
 
 const hasIdColumn = computed(() => orderedFieldKeys.value.includes('id'))
 const childHasIdColumn = computed(() => childOrderedFieldKeys.value.includes('id'))
@@ -487,7 +651,7 @@ const formKeys = computed(() => {
 })
 
 const scrollXMin = computed(() => {
-  const n = effectiveDataKeys.value.length
+  const n = gridDisplayKeys.value.length
   return Math.max(800, n * 124 + (hasIdColumn.value ? 120 : 0))
 })
 
@@ -533,7 +697,7 @@ function bindHeaderSortable() {
       if (evt.oldIndex === evt.newIndex) return
       const off = 1
       if (evt.oldIndex < off || evt.newIndex < off) return
-      const keys = [...effectiveDataKeys.value]
+      const keys = [...gridDisplayKeys.value]
       const from = evt.oldIndex - off
       const to = evt.newIndex - off
       if (from < 0 || from >= keys.length) return
@@ -541,10 +705,13 @@ function bindHeaderSortable() {
       const next = [...keys]
       const [moved] = next.splice(from, 1)
       next.splice(to, 0, moved)
-      manualOrder.value = next
+      const hidden = effectiveDataKeys.value.filter((k) =>
+        shouldHideGridField(k, colDefs.value)
+      )
+      manualOrder.value = [...next, ...hidden]
       localStorage.setItem(
         `aierp:colOrder:${displaySchema.value}.${displayTable.value}`,
-        JSON.stringify(next)
+        JSON.stringify(manualOrder.value)
       )
     },
   })
@@ -894,8 +1061,8 @@ function buildDataColumn(key) {
   }
 }
 
-// 列 key 字符串快照，只在列结构变化时触发 columns 重算，避免 rows 更新导致表头重渲染
-const _colKeysSnapshot = computed(() => effectiveDataKeys.value.join('|'))
+// 列 key 字符串快照（仅展示列），只在列结构变化时触发 columns 重算
+const _colKeysSnapshot = computed(() => gridDisplayKeys.value.join('|'))
 
 const columns = computed(() => {
   const keysStr = _colKeysSnapshot.value
@@ -973,7 +1140,7 @@ function buildChildDataColumn(key) {
   }
 }
 
-const _childColKeysSnapshot = computed(() => childOrderedFieldKeys.value.join('|'))
+const _childColKeysSnapshot = computed(() => childGridDisplayKeys.value.join('|'))
 
 const childColumns = computed(() => {
   const keysStr = _childColKeysSnapshot.value
@@ -1016,7 +1183,7 @@ const childColumns = computed(() => {
 })
 
 const childScrollXMin = computed(() => {
-  const n = childOrderedFieldKeys.value.length
+  const n = childGridDisplayKeys.value.length
   return Math.max(640, n * 120 + (childHasIdColumn.value ? 120 : 0))
 })
 
@@ -1170,8 +1337,14 @@ async function load() {
     store.fetchColumnLabels(displayTable.value),
   ])
   if (!store.nav.design?.length && !store.nav.prep?.length && !store.nav.run?.length) {
-    await store.fetchNavTables()
+    if (authStore.currentUser?.id != null) {
+      await store.fetchUserMenu(authStore.currentUser.id)
+    } else {
+      await store.fetchNavTables()
+    }
   }
+  await store.ensureTableCn(displayTable.value)
+  if (splitCfg.value) await store.ensureTableCn(childTable.value)
   rows.value = data.rows || []
   colDefs.value = labels.columns || []
   pagination.itemCount =
@@ -1274,7 +1447,13 @@ watch(
     rows.value = []
     colDefs.value = []
     pagination.page = 1
-    pagination.pageSize = 500
+    if (splitCfg.value) {
+      pagination.pageSize = SPLIT_PARENT_PAGE_SIZE
+      pagination.pageSizes = [...SPLIT_PARENT_PAGE_SIZES]
+    } else {
+      pagination.pageSize = SINGLE_TABLE_PAGE_SIZE
+      pagination.pageSizes = [...SINGLE_TABLE_PAGE_SIZES]
+    }
     pagination.itemCount = 0
     sortBy.value = 'id'
     sortOrder.value = 'desc'
@@ -1298,6 +1477,56 @@ watch(
   },
   { flush: 'post' }
 )
+
+watch(
+  () => [splitCfg.value, schema.value, displayTable.value, tableWrapRef.value],
+  async () => {
+    if (!splitCfg.value || !tableWrapRef.value) {
+      unbindSplitObservers()
+      splitTopInitializedFor.value = ''
+      return
+    }
+    const id = `${schema.value}.${displayTable.value}`
+    await nextTick()
+    const root = tableWrapRef.value
+    if (!root?.clientHeight) return
+    if (splitTopInitializedFor.value !== id) {
+      splitTopInitializedFor.value = id
+      const key = `aierp.layout.splitTop.${id}`
+      const saved = localStorage.getItem(key)
+      if (saved != null) {
+        const n = parseInt(saved, 10)
+        splitTopPx.value = !Number.isNaN(n)
+          ? clampSplitTop(n, root.clientHeight)
+          : clampSplitTop(Math.round(root.clientHeight * 0.45), root.clientHeight)
+      } else {
+        splitTopPx.value = clampSplitTop(Math.round(root.clientHeight * 0.45), root.clientHeight)
+      }
+    } else {
+      splitTopPx.value = clampSplitTop(splitTopPx.value, root.clientHeight)
+    }
+    await nextTick()
+    bindSplitObservers()
+    updateSplitScrollHeights()
+  },
+  { flush: 'post' }
+)
+
+watch(
+  () => selectedParentKey.value,
+  () => {
+    if (!splitCfg.value) return
+    nextTick(() => {
+      bindSplitObservers()
+      updateSplitScrollHeights()
+    })
+  }
+)
+
+onUnmounted(() => {
+  unbindSplitObservers()
+  window.removeEventListener('mousemove', onSplitHorizontalMove)
+})
 
 onBeforeUnmount(() => {
   destroyHeaderSortable()
@@ -1384,7 +1613,8 @@ onBeforeUnmount(() => {
 
 .table-wrap {
   flex: 1;
-  overflow: hidden;
+  overflow-x: auto;
+  overflow-y: hidden;
   min-width: 0;
   display: flex;
   flex-direction: column;
@@ -1482,6 +1712,34 @@ onBeforeUnmount(() => {
   color: var(--text-1);
 }
 
+/* 表头筛选 / 工具栏：与页面浅色变量一致（修复 darkTheme 下整框 --n-color 与 input-el 背景不一致导致的「半块黑条」） */
+:deep(.crud-modal .n-input) {
+  --n-color: var(--bg-panel) !important;
+  --n-color-focus: var(--bg-panel) !important;
+  --n-text-color: var(--text-1) !important;
+  --n-placeholder-color: var(--text-3) !important;
+  --n-border: 1px solid var(--border) !important;
+  --n-border-hover: 1px solid var(--border-hi) !important;
+  --n-border-focus: 1px solid var(--border-hi) !important;
+  --n-box-shadow-focus: none !important;
+}
+
+:deep(.filter-global.n-input),
+:deep(.th-filter.n-input) {
+  --n-color: var(--bg-panel) !important;
+  --n-color-focus: var(--bg-panel) !important;
+  --n-text-color: var(--text-1) !important;
+  --n-placeholder-color: var(--text-3) !important;
+  --n-border: 1px solid var(--border) !important;
+  --n-border-hover: 1px solid var(--border-hi) !important;
+  --n-border-focus: 1px solid var(--border-hi) !important;
+  --n-box-shadow-focus: none !important;
+  --n-caret-color: var(--text-1) !important;
+  --n-clear-color: var(--text-3) !important;
+  --n-clear-color-hover: var(--text-2) !important;
+  --n-clear-color-pressed: var(--text-1) !important;
+}
+
 /* 表头筛选 / 弹窗输入：与全局浅色主题一致 */
 :deep(.filter-global .n-input__input-el),
 :deep(.filter-global .n-input__textarea-el),
@@ -1493,28 +1751,28 @@ onBeforeUnmount(() => {
   caret-color: var(--text-1) !important;
 }
 
+:deep(.filter-global .n-input__input-el),
+:deep(.th-filter .n-input__input-el) {
+  background-color: transparent !important;
+}
+
 :deep(.filter-global .n-input__placeholder),
 :deep(.th-filter .n-input__placeholder),
 :deep(.crud-modal .n-input__placeholder) {
   color: var(--text-3) !important;
 }
 
-:deep(.filter-global .n-input__input-el),
-:deep(.th-filter .n-input__input-el),
 :deep(.crud-modal .n-input__input-el) {
   background: var(--bg-panel) !important;
 }
 
-:deep(.filter-global .n-input__textarea-el),
-:deep(.th-filter .n-input__textarea-el),
-:deep(.crud-modal .n-input__textarea-el) {
+:deep(.crud-modal .n-input__textarea-el),
+:deep(.th-filter .n-input__textarea-el) {
   background: var(--bg-panel) !important;
 }
 
 :deep(.crud-modal input),
-:deep(.crud-modal textarea),
-:deep(.th-filter input),
-:deep(.th-filter textarea) {
+:deep(.crud-modal textarea) {
   color: var(--text-1) !important;
   caret-color: var(--text-1) !important;
   background: var(--bg-panel) !important;
@@ -1556,9 +1814,11 @@ onBeforeUnmount(() => {
 .split-root {
   flex: 1;
   min-height: 0;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 0;
+  /* 外层不要横向滚动，避免与内部表格滚动条、分割条抢焦点 */
   overflow: hidden;
 }
 
@@ -1567,8 +1827,34 @@ onBeforeUnmount(() => {
   flex-direction: column;
   gap: 8px;
   min-height: 0;
+  min-width: 0;
   flex: 1 1 50%;
   overflow: hidden;
+}
+
+.split-pane--parent {
+  min-height: 0;
+}
+
+/* 主表表格区与下方子表分割条留出间距，避免横向滚动条被分割条盖住 */
+.split-pane--parent .split-table-scroll {
+  margin-bottom: 12px;
+  position: relative;
+  z-index: 2;
+}
+
+.split-table-scroll {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+/* 横向宽表：flex 子项默认可收缩，避免内部横向滚动被吃掉 */
+:deep(.n-data-table) {
+  min-width: 0;
 }
 
 .split-pane-title {
@@ -1583,11 +1869,19 @@ onBeforeUnmount(() => {
   font-weight: 400;
 }
 
-.split-divider {
+.split-h-handle {
   flex-shrink: 0;
-  height: 1px;
-  background: var(--border-hi);
-  margin: 4px 0;
+  height: 8px;
+  margin: 0;
+  cursor: ns-resize;
+  border-radius: 3px;
+  background: transparent;
+  position: relative;
+  z-index: 1;
+}
+.split-h-handle:hover,
+.split-h-handle:active {
+  background: color-mix(in srgb, var(--border-hi) 75%, transparent);
 }
 
 .split-child-placeholder {

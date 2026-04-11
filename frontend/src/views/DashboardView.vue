@@ -1,64 +1,88 @@
 <template>
-  <div class="view">
+  <div class="view dashboard-view">
     <div class="view-header">
       <h1 class="view-title">仪表盘</h1>
       <span class="mono text-3">{{ now }}</span>
     </div>
 
-    <div class="stats-grid">
-      <div class="stat-card" v-for="s in stats" :key="s.label">
-        <div class="stat-value mono">{{ s.value }}</div>
-        <div class="stat-label">{{ s.label }}</div>
-      </div>
-    </div>
-
-    <div class="section">
-      <div class="section-title mono">元数据表</div>
-      <div class="table-chips">
-        <router-link
-          v-for="t in store.tables.meta"
-          :key="t"
-          :to="`/meta/${t}`"
-          class="chip"
-        >{{ t }}</router-link>
-      </div>
-    </div>
-
-    <div class="section">
-      <div class="section-title mono">业务数据表</div>
-      <div class="table-chips">
-        <router-link
-          v-for="t in store.tables.business"
-          :key="t"
-          :to="`/business/${t}`"
-          class="chip"
-        >{{ t }}</router-link>
+    <div v-if="loading" class="loading-hint text-2">加载中…</div>
+    <div v-else-if="loadError" class="load-err">{{ loadError }}</div>
+    <div v-else-if="!authStore.currentUser?.id" class="text-2">请先登录后查看仪表盘。</div>
+    <div v-else-if="!cards.length" class="text-2">暂无仪表盘卡片（可由管理员通过 AI 配置）。</div>
+    <div v-else class="cards-grid">
+      <div v-for="card in cards" :key="card.id" class="card-wrapper">
+        <NumberCard v-if="card.card_type === 'number'" :card="card" />
+        <BarCard v-else-if="card.card_type === 'bar'" :card="card" />
+        <PieCard v-else-if="card.card_type === 'pie'" :card="card" />
+        <LineCard v-else-if="card.card_type === 'line'" :card="card" />
+        <ListCard v-else-if="card.card_type === 'list'" :card="card" />
       </div>
     </div>
   </div>
 </template>
 
 <script setup>
-import { computed } from 'vue'
-import { useAppStore } from '../stores/app'
+import { ref, onMounted } from 'vue'
+import { useAuthStore } from '../stores/auth'
+import NumberCard from '../components/dashboard/NumberCard.vue'
+import BarCard from '../components/dashboard/BarCard.vue'
+import PieCard from '../components/dashboard/PieCard.vue'
+import LineCard from '../components/dashboard/LineCard.vue'
+import ListCard from '../components/dashboard/ListCard.vue'
 
-const store = useAppStore()
-const now = new Date().toLocaleDateString('zh-CN', { year:'numeric', month:'long', day:'numeric' })
+const API = 'http://localhost:8000'
 
-const stats = computed(() => [
-  { label: 'meta 目录表', value: store.tables.meta.length },
-  { label: '业务数据表', value: store.tables.business.length },
-  { label: 'Schema 总数', value: 2 },
-])
+const authStore = useAuthStore()
+const now = new Date().toLocaleDateString('zh-CN', {
+  year: 'numeric',
+  month: 'long',
+  day: 'numeric',
+})
+
+const cards = ref([])
+const loading = ref(true)
+const loadError = ref('')
+
+onMounted(async () => {
+  const uid = authStore.currentUser?.id
+  if (!uid) {
+    loading.value = false
+    return
+  }
+  loading.value = true
+  loadError.value = ''
+  try {
+    const res = await fetch(`${API}/api/dashboard?user_id=${encodeURIComponent(uid)}`)
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) {
+      const d = data?.detail
+      const raw = typeof d === 'string' ? d : res.statusText || '加载失败'
+      // 保留：旧后端仍可能返回「仪表盘加载失败」，界面统一显示为友好文案
+      loadError.value =
+        raw === '仪表盘加载失败' ? '您还未创建个人仪表盘。' : raw
+      cards.value = []
+      return
+    }
+    cards.value = Array.isArray(data.cards) ? data.cards : []
+  } catch (e) {
+    loadError.value = e?.message || '网络错误'
+    cards.value = []
+  } finally {
+    loading.value = false
+  }
+})
 </script>
 
 <style scoped>
-.view { padding: 32px 36px; max-width: 900px; }
+.view {
+  padding: 32px 36px;
+  max-width: 1100px;
+}
 .view-header {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  margin-bottom: 32px;
+  margin-bottom: 24px;
   padding-bottom: 20px;
   border-bottom: 1px solid var(--border);
 }
@@ -69,54 +93,22 @@ const stats = computed(() => [
   color: var(--text-1);
 }
 
-.stats-grid {
+.loading-hint,
+.load-err {
+  margin-bottom: 16px;
+}
+.load-err {
+  color: #f44336;
+  font-size: 13px;
+}
+
+.cards-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
   gap: 16px;
   margin-bottom: 40px;
 }
-.stat-card {
-  background: var(--bg-panel);
-  border: 1px solid var(--border);
-  padding: 20px 24px;
-  border-radius: var(--radius);
-}
-.stat-value {
-  font-size: 32px;
-  font-weight: 300;
-  color: var(--text-1);
-  line-height: 1;
-  margin-bottom: 6px;
-}
-.stat-label { font-size: 12px; color: var(--text-3); }
-
-.section { margin-bottom: 32px; }
-.section-title {
-  font-size: 11px;
-  color: var(--text-3);
-  letter-spacing: 0.15em;
-  text-transform: uppercase;
-  margin-bottom: 12px;
-}
-.table-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-.chip {
-  font-family: var(--font-mono);
-  font-size: 12px;
-  padding: 5px 12px;
-  background: var(--bg-panel);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  color: var(--text-2);
-  text-decoration: none;
-  transition: all var(--transition);
-}
-.chip:hover {
-  border-color: var(--border-hi);
-  color: var(--text-1);
-  background: var(--bg-active);
+.card-wrapper {
+  min-width: 0;
 }
 </style>

@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
+import { useAppStore } from './app'
 
 const API = 'http://localhost:8000'
 
@@ -19,6 +20,7 @@ export const useAuthStore = defineStore('auth', () => {
       if (data.success && data.user) {
         currentUser.value = data.user
         localStorage.setItem('aierp_user_id', String(data.user.id))
+        await useAppStore().fetchUserMenu(data.user.id)
         return true
       }
       loginError.value =
@@ -33,6 +35,7 @@ export const useAuthStore = defineStore('auth', () => {
   function logout() {
     currentUser.value = null
     localStorage.removeItem('aierp_user_id')
+    useAppStore().clearUserMenu()
   }
 
   async function restoreSession() {
@@ -42,12 +45,16 @@ export const useAuthStore = defineStore('auth', () => {
       const res = await fetch(`${API}/auth/me?user_id=${encodeURIComponent(userId)}`)
       if (res.ok) {
         const data = await res.json()
-        currentUser.value = data.user ?? data
+        const u = data.user ?? data
+        currentUser.value = u
+        await useAppStore().fetchUserMenu(u?.id)
       } else {
         localStorage.removeItem('aierp_user_id')
+        useAppStore().clearUserMenu()
       }
     } catch {
       localStorage.removeItem('aierp_user_id')
+      useAppStore().clearUserMenu()
     }
   }
 

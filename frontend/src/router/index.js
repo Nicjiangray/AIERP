@@ -13,15 +13,11 @@ const routes = [
   },
   {
     path: '/meta',
-    name: 'meta',
-    component: () => import('../views/MetaView.vue'),
-    meta: { title: '元数据' }
+    redirect: '/dashboard'
   },
   {
     path: '/meta/:table',
-    name: 'meta-table',
-    component: () => import('../views/TableView.vue'),
-    meta: { title: '表数据' }
+    redirect: '/dashboard'
   },
   {
     path: '/business',

@@ -15,7 +15,6 @@
 
     <div class="nav-quick">
       <router-link to="/dashboard" class="quick-link" active-class="active">仪表盘</router-link>
-      <router-link to="/ai-rules" class="quick-link" active-class="active">AI 规则</router-link>
       <router-link to="/memory" class="quick-link" active-class="active">记忆</router-link>
     </div>
 
@@ -45,7 +44,11 @@ onMounted(async () => {
     const res = await fetch('http://localhost:8000/')
     apiOk.value = res.ok
     await store.fetchTables()
-    await store.fetchNavTables()
+    if (auth.currentUser?.id != null) {
+      await store.fetchUserMenu(auth.currentUser.id)
+    } else {
+      await store.fetchNavTables()
+    }
   } catch {
     apiOk.value = false
   }

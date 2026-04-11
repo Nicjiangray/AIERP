@@ -8,6 +8,8 @@ export const useAppStore = defineStore('app', () => {
   const tables = ref({ meta: [], business: [] })
   const nav = ref({ design: [], prep: [], run: [] })
   const loading = ref(false)
+  /** table_name -> 中文表名（来自 meta_tables 或 null）；用对象便于覆盖更新 */
+  const tableCnByName = ref({})
 
   async function fetchTables() {
     try {
@@ -30,9 +32,86 @@ export const useAppStore = defineStore('app', () => {
         prep: data.prep || [],
         run: data.run || [],
       }
+      const next = { ...tableCnByName.value }
+      for (const block of ['design', 'prep', 'run']) {
+        for (const item of nav.value[block] || []) {
+          if (item.table_name && item.table_cn) {
+            next[item.table_name] = item.table_cn
+          }
+        }
+      }
+      tableCnByName.value = next
     } catch (e) {
       console.error('fetchNavTables failed', e)
     }
+  }
+
+  /** 权限驱动导航（与 /nav/tables 结构相同）；未登录勿调用 */
+  async function fetchUserMenu(userId) {
+    if (userId == null || userId === '') {
+      clearUserMenu()
+      return
+    }
+    try {
+      const res = await fetch(
+        `${API}/api/user-menu?user_id=${encodeURIComponent(userId)}`
+      )
+      if (!res.ok) throw new Error('user-menu failed')
+      const data = await res.json()
+      nav.value = {
+        design: data.design || [],
+        prep: data.prep || [],
+        run: data.run || [],
+      }
+      const next = { ...tableCnByName.value }
+      for (const block of ['design', 'prep', 'run']) {
+        for (const item of nav.value[block] || []) {
+          if (item.table_name && item.table_cn) {
+            next[item.table_name] = item.table_cn
+          }
+        }
+      }
+      tableCnByName.value = next
+    } catch (e) {
+      console.error('fetchUserMenu failed', e)
+    }
+  }
+
+  function clearUserMenu() {
+    nav.value = { design: [], prep: [], run: [] }
+  }
+
+  /** 解析中文表名：先导航缓存，再请求 meta_tables */
+  async function ensureTableCn(tableName) {
+    const name = String(tableName || '')
+    if (!name) return null
+    if (tableCnByName.value[name] !== undefined) {
+      return tableCnByName.value[name]
+    }
+    try {
+      const res = await fetch(
+        `${API}/meta/table-cn/${encodeURIComponent(name)}`
+      )
+      if (!res.ok) {
+        tableCnByName.value = { ...tableCnByName.value, [name]: null }
+        return null
+      }
+      const data = await res.json()
+      const cn = data.table_cn || null
+      tableCnByName.value = { ...tableCnByName.value, [name]: cn }
+      return cn
+    } catch {
+      tableCnByName.value = { ...tableCnByName.value, [name]: null }
+      return null
+    }
+  }
+
+  function resolveTableCn(tableName) {
+    const name = String(tableName || '')
+    if (!name) return ''
+    const hit = tableCnByName.value[name]
+    if (hit) return hit
+    return ''
   }
 
   async function fetchColumnLabels(tableName) {
@@ -118,9 +197,14 @@ export const useAppStore = defineStore('app', () => {
   return {
     tables,
     nav,
+    tableCnByName,
+    ensureTableCn,
+    resolveTableCn,
     loading,
     fetchTables,
     fetchNavTables,
+    fetchUserMenu,
+    clearUserMenu,
     fetchColumnLabels,
     fetchTableData,
     tableInsert,

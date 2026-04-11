@@ -13,18 +13,6 @@
     </div>
 
     <div class="section">
-      <div class="section-title mono">元数据表</div>
-      <div class="table-chips">
-        <router-link
-          v-for="t in store.tables.meta"
-          :key="t"
-          :to="`/meta/${t}`"
-          class="chip"
-        >{{ t }}</router-link>
-      </div>
-    </div>
-
-    <div class="section">
       <div class="section-title mono">业务数据表</div>
       <div class="table-chips">
         <router-link
@@ -46,9 +34,7 @@ const store = useAppStore()
 const now = new Date().toLocaleDateString('zh-CN', { year:'numeric', month:'long', day:'numeric' })
 
 const stats = computed(() => [
-  { label: 'meta 目录表', value: store.tables.meta.length },
   { label: '业务数据表', value: store.tables.business.length },
-  { label: 'Schema 总数', value: 2 },
 ])
 </script>
 
@@ -71,7 +57,7 @@ const stats = computed(() => [
 
 .stats-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
   gap: 16px;
   margin-bottom: 40px;
 }

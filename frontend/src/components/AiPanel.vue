@@ -19,17 +19,11 @@
 
     <!-- 对话列表 -->
     <div class="chat-body" ref="chatBodyRef">
-      <!-- 空状态 -->
+      <!-- 空状态：本地欢迎语（不入库），首条发送后会写入 messages 保留在列表中 -->
       <div v-if="messages.length === 0" class="empty-state">
-        <div class="empty-icon">◈</div>
-        <p>向 AI 提问关于数据库、业务规则或任何 ERP 相关问题</p>
-        <div class="suggestions">
-          <button
-            v-for="s in suggestions"
-            :key="s"
-            class="suggestion"
-            @click="sendMessage(s)"
-          >{{ s }}</button>
+        <div class="message assistant msg-local-welcome empty-welcome">
+          <div class="msg-meta mono">AI</div>
+          <div class="msg-body" v-html="renderMarkdown(localWelcomeText)"></div>
         </div>
       </div>
 
@@ -38,7 +32,13 @@
         v-for="(msg, i) in messages"
         :key="i"
         class="message"
-        :class="[msg.role, { 'confirm-exec-error': msg.confirmExecError }]"
+        :class="[
+          msg.role,
+          {
+            'confirm-exec-error': msg.confirmExecError,
+            'msg-local-welcome': msg.isLocalWelcome,
+          },
+        ]"
       >
         <!-- 新建实体：待确认写入（独立卡片，非普通气泡） -->
         <template v-if="msg.role === 'assistant' && msg.confirmRequired">
@@ -264,6 +264,39 @@
           </div>
         </template>
         <div
+          v-if="showAssistantFeedback(msg)"
+          class="feedback-area"
+        >
+          <template v-if="feedbackOpenIndex === i">
+            <div class="feedback-input-area">
+              <textarea
+                v-model="feedbackDraft"
+                placeholder="哪里不对？简单说几句就行"
+                rows="2"
+                maxlength="500"
+              />
+              <div class="feedback-actions">
+                <button type="button" class="feedback-submit" @click="submitFeedback(i)">
+                  提交
+                </button>
+                <button type="button" class="feedback-cancel" @click="closeFeedback">取消</button>
+              </div>
+            </div>
+          </template>
+          <template v-else>
+            <button
+              v-if="!msg.feedbackSent"
+              type="button"
+              class="feedback-btn"
+              title="回答有问题"
+              @click="openFeedback(i)"
+            >
+              👎
+            </button>
+            <span v-else class="feedback-done">已反馈</span>
+          </template>
+        </div>
+        <div
           v-if="msg.role === 'assistant' && msg.writePreview"
           class="msg-write-preview-card"
         >
@@ -416,6 +449,14 @@ import { useAuthStore } from '../stores/auth'
 
 const authStore = useAuthStore()
 
+/** 仅前端展示的欢迎语（不写入 ai_chat；发往 /ai/chat 时在 buildApiHistory 中排除） */
+const localWelcomeText =
+  '您好！我是您的数字助手。\n\n' +
+  '我能帮您处理公司的各项业务——查数据、下订单、管库存、做对账，虽然我还在学习中，但能力会越来越强。\n\n' +
+  '我也能为您统计和展现公司经营数据，用数字、图表让全局一目了然。\n\n' +
+  '您交代过的事情和偏好我会记在心里，不过时间久了可能会慢慢淡忘，重要的事您可以提醒我。\n\n' +
+  '总之，尽管告诉我，也许会让您大吃一惊。'
+
 function buildColumnsFromRows(rows) {
   if (!rows?.length) return []
   return Object.keys(rows[0]).map((key) => ({
@@ -511,6 +552,61 @@ function formatPreviewValue(v) {
 
 const API_BASE = 'http://localhost:8000'
 
+const feedbackOpenIndex = ref(null)
+const feedbackDraft = ref('')
+
+function showAssistantFeedback(msg) {
+  return (
+    msg &&
+    msg.role === 'assistant' &&
+    !msg.isLocalWelcome &&
+    !msg.writePreview &&
+    !msg.confirmRequired
+  )
+}
+
+function openFeedback(i) {
+  feedbackOpenIndex.value = i
+  feedbackDraft.value = ''
+}
+
+function closeFeedback() {
+  feedbackOpenIndex.value = null
+}
+
+async function submitFeedback(i) {
+  const uid = authStore.currentUser?.id
+  if (uid == null) {
+    window.alert('请先登录后再反馈')
+    return
+  }
+  const sid = chatSessionId.value
+  try {
+    const res = await fetch(`${API_BASE}/ai/feedback`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_id: sid,
+        user_id: uid,
+        chat_id: null,
+        feedback_type: 'thumbs_down',
+        content: feedbackDraft.value || '',
+      }),
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) {
+      const d = data?.detail || data?.message || '提交失败'
+      throw new Error(typeof d === 'string' ? d : JSON.stringify(d))
+    }
+    const m = messages.value[i]
+    if (m) m.feedbackSent = true
+    feedbackOpenIndex.value = null
+    feedbackDraft.value = ''
+  } catch (e) {
+    window.alert(e?.message || '提交失败')
+  }
+}
+
 const chatSessionId = ref(null)
 const lastFrameId = ref(null)
 const lastErrorMessage = ref(null)
@@ -553,6 +649,7 @@ async function confirmWritePreview(idx) {
       body: JSON.stringify({
         payload: m.writePreview.payload,
         session_id: chatSessionId.value,
+        user_id: authStore.currentUser?.id,
       }),
     })
     const data = await res.json().catch(() => ({}))
@@ -701,12 +798,6 @@ function stopGeneration() {
   chatAbortController.value?.abort()
 }
 
-const suggestions = [
-  '当前数据库有哪些表？',
-  '解释 ai_rules 表的用途',
-  '帮我分析业务数据结构',
-]
-
 const allowedAccept =
   'image/jpeg,image/png,image/webp,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,application/pdf'
 
@@ -764,6 +855,7 @@ function applySessionFromSseStart(payload) {
 function buildApiHistory() {
   const step1 = messages.value.filter((m) => {
     if (!m || !m.role) return false
+    if (m.isLocalWelcome) return false
     if (m.role === 'system') return false
     if (m.role === 'assistant') {
       const c = (m.content || '').trim()
@@ -975,6 +1067,13 @@ async function readSseStreamBody(res, handleStreamPayload) {
 
 async function sendMessage(text) {
   inputText.value = ''
+  if (messages.value.length === 0) {
+    messages.value.push({
+      role: 'assistant',
+      content: localWelcomeText,
+      isLocalWelcome: true,
+    })
+  }
   messages.value.push({ role: 'user', content: text })
   await scrollToBottom()
 
@@ -1494,44 +1593,78 @@ async function confirmOperation() {
   flex: 1;
   display: flex;
   flex-direction: column;
-  align-items: center;
-  justify-content: center;
+  align-items: stretch;
+  justify-content: flex-start;
   gap: 12px;
-  text-align: center;
-  padding: 24px 8px;
+  text-align: left;
+  padding: 8px 0 24px;
 }
-.empty-icon {
-  font-size: 28px;
-  color: var(--text-3);
+.empty-welcome {
+  width: 100%;
 }
-.empty-state p {
+
+.feedback-area {
+  margin-top: 4px;
+  text-align: right;
+  width: 100%;
+}
+.feedback-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+  opacity: 0.3;
+  padding: 2px 6px;
+  border-radius: 4px;
+  transition: opacity 0.2s;
+}
+.feedback-btn:hover {
+  opacity: 0.8;
+  background: var(--bg-hover);
+}
+.feedback-done {
   font-size: 12px;
   color: var(--text-3);
-  line-height: 1.7;
 }
-.suggestions {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  width: 100%;
+.feedback-input-area {
   margin-top: 8px;
-}
-.suggestion {
+  padding: 8px;
   background: var(--bg-hover);
+  border-radius: 6px;
+  text-align: left;
+}
+.feedback-input-area textarea {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px;
+  font-size: 13px;
+  resize: none;
+  font-family: var(--font-body);
+  background: var(--bg-panel);
+  color: var(--text-1);
+}
+.feedback-actions {
+  margin-top: 6px;
+  text-align: right;
+}
+.feedback-actions button {
+  margin-left: 8px;
+  padding: 4px 12px;
+  font-size: 12px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.feedback-submit {
+  background: var(--accent-hi, #1976d2);
+  color: #fff;
+  border: none;
+}
+.feedback-cancel {
+  background: var(--bg-panel);
   border: 1px solid var(--border);
   color: var(--text-2);
-  font-size: 11px;
-  padding: 7px 12px;
-  border-radius: var(--radius);
-  cursor: pointer;
-  text-align: left;
-  font-family: var(--font-body);
-  transition: all var(--transition);
-}
-.suggestion:hover {
-  border-color: var(--border-hi);
-  color: var(--text-1);
-  background: var(--bg-active);
 }
 
 /* Messages */
@@ -1561,6 +1694,13 @@ async function confirmOperation() {
 }
 .message.assistant .msg-body {
   color: var(--text-2);
+}
+.message.assistant.msg-local-welcome .msg-body {
+  background: var(--bg-hover);
+  border: 1px solid var(--border);
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  text-align: left;
 }
 .message.system .msg-system-line {
   font-size: 12px;
