@@ -550,7 +550,7 @@ function formatPreviewValue(v) {
   return String(v)
 }
 
-const API_BASE = 'http://localhost:8000'
+const API_BASE = ''
 
 const feedbackOpenIndex = ref(null)
 const feedbackDraft = ref('')

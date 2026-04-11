@@ -46,7 +46,7 @@ const apiOk = ref(false)
 
 onMounted(async () => {
   try {
-    const res = await fetch('http://localhost:8000/')
+    const res = await fetch('/')
     apiOk.value = res.ok
     await store.fetchTables()
   } catch {

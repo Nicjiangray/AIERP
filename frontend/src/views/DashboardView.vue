@@ -30,7 +30,7 @@ import PieCard from '../components/dashboard/PieCard.vue'
 import LineCard from '../components/dashboard/LineCard.vue'
 import ListCard from '../components/dashboard/ListCard.vue'
 
-const API = 'http://localhost:8000'
+const API = ''
 
 const authStore = useAuthStore()
 const now = new Date().toLocaleDateString('zh-CN', {

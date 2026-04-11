@@ -303,7 +303,7 @@ aierp/
 | **`views/LoginView.vue`** | **登录页**：登录名 + 密码 → **`POST /auth/login`** | 可用 |
 | **`stores/auth.js`** | **`currentUser`**、`login` / `logout` / **`restoreSession`**（`localStorage`：`aierp_user_id`） | 可用 |
 | `router/index.js` | `/dashboard`、`/business`、`/business/:table`、`/memory`、`/ai-rules`；**`/meta`、`/meta/:table` 重定向 `/dashboard`** | 可用（登录页不走路由，由 `App.vue` 条件渲染） |
-| `stores/app.js` | 请求 `http://localhost:8000` 的 `/tables`、`/nav/tables`、`/table-columns`、`/table/...`、导出 URL、表 CRUD；登录后 **`fetchUserMenu`**（`/api/user-menu`） | 可用 |
+| `stores/app.js` | API 基址为空字符串（同域），请求 `/tables`、`/nav/tables`、`/table-columns`、`/table/...`、导出 URL、表 CRUD；登录后 **`fetchUserMenu`**（`/api/user-menu`） | 可用 |
 | `components/NavPanel.vue` | 侧栏导航；**展示当前用户名 + 退出**；快捷链接 **仪表盘 / 记忆**（无元数据入口、无侧栏「AI 规则」） | 可用 |
 | `components/DataNavPanel.vue` | 数据侧导航：**`GET /api/user-menu`** 驱动可见表（个人+角色权限合并） | 可用 |
 | `components/AiPanel.vue` | AI 对话：SSE **`/ai/chat`**、**`/ai/confirm`**；加载中可 **「终止」** 中断 SSE；**空白欢迎语（不入库）** + **👎 反馈** → **`POST /ai/feedback`**；请求体 **`user_id` 取自 `useAuthStore().currentUser?.id`** | 可用 |

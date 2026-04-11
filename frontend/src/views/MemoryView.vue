@@ -74,7 +74,7 @@ import { ref, computed, watch, onMounted } from 'vue'
 import { NSpin } from 'naive-ui'
 import { useAuthStore } from '../stores/auth'
 
-const API = 'http://localhost:8000'
+const API = ''
 const auth = useAuthStore()
 
 const uid = computed(() => auth.currentUser?.id ?? null)

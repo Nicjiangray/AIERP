@@ -93,7 +93,7 @@
 | `src/main.js` | `createApp`、Pinia、Router、挂载 `#app` |
 | `src/App.vue` | 布局：`NavPanel` + `<RouterView />` + `AiPanel` |
 | `src/router/index.js` | 路由：`/dashboard`、`/meta`、`/meta/:table`、`/business`、`/business/:table`、`/ai-rules` |
-| `src/stores/app.js` | Pinia store：请求 `http://localhost:8000` 的 tables/nav/columns/CRUD/导出 |
+| `src/stores/app.js` | Pinia store：API 基址为空（同域），请求 tables/nav/columns/CRUD/导出 |
 | `src/assets/main.css` | 全局样式（由 `main.js` 引入） |
 | `src/components/NavPanel.vue` | 侧栏导航、探测后端 `/`、拉取 tables/nav |
 | `src/components/DataNavPanel.vue` | 数据区导航（被 NavPanel 使用） |
@@ -319,7 +319,7 @@
   - `/business/:table` → `TableView.vue`
   - `/ai-rules` → `AiRulesView.vue`（AI 规则）
 - **全局布局**：`App.vue` 中左侧 `NavPanel`、中间 `RouterView`、右侧 `AiPanel`。
-- **API 基址**：`src/stores/app.js` 与 `src/utils/tableExport.js` 中写死 `http://localhost:8000`（与 `dev.sh` 后端端口一致）。
+- **API 基址**：`src/stores/app.js` 与 `src/utils/tableExport.js` 中为空字符串（同域；本地开发可由代理指向后端）。
 
 ---
 

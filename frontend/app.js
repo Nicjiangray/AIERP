@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 
-const API = 'http://localhost:8000'
+const API = ''
 
 export const useAppStore = defineStore('app', () => {
   const tables = ref({ meta: [], business: [] })

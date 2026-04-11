@@ -1,5 +1,5 @@
 /** 与后端 GET /export/xlsx/... 查询参数一致 */
-const API = 'http://localhost:8000'
+const API = ''
 
 export function buildExportXlsxUrl(schema, table, limit, cols, opts = {}) {
   const { filters, q, sortBy, sortOrder } = opts
