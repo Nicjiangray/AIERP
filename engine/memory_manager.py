@@ -1,6 +1,6 @@
 """
 engine/memory_manager.py
-记忆管理员：session 清洗（对话→要点）和 longterm 压缩（合并+规律提炼）。
+记忆管理员：session 清洗（对话→要点）、中期记忆合并（midterm）、longterm 压缩。
 
 LLM 调用说明（与 llm/client.py 一致）：
 - `chat()` 使用环境变量 LLM_MODEL_NAME / LLM_BASE_URL / LLM_API_KEY（主客户端）。
@@ -178,21 +178,112 @@ def clean_session(session_id: int) -> Dict[str, Any]:
             )
         conn.commit()
 
+    mt_out: Dict[str, Any] = {"success": False, "skipped": True}
+    try:
+        mt_out = merge_midterm(user_id, result.strip())
+    except Exception as e:
+        logger.warning(
+            "merge_midterm failed after clean_session user_id=%s session_id=%s: %s",
+            user_id,
+            session_id,
+            e,
+        )
+        mt_out = {"success": False, "error": str(e)}
+
     return {
         "success": True,
         "content": result.strip(),
         "session_id": session_id,
         "user_id": user_id,
+        "midterm_merge": mt_out,
     }
+
+
+def merge_midterm(user_id: int, new_session_points: str) -> Dict[str, Any]:
+    """
+    将本轮 session 清洗要点合并进 scope=midterm（每用户单行，upsert）。
+    用 LLM 去矛盾、去重；不缩写。
+    """
+    new_session_points = (new_session_points or "").strip()
+    if not new_session_points:
+        return {"success": False, "skipped": True, "reason": "empty_session_points"}
+
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, content FROM business.ai_memory
+                WHERE user_id = %s AND scope = 'midterm'
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (user_id,),
+            )
+            row = cur.fetchone()
+
+    existing = (
+        str(row[1]).strip() if row and row[1] else "（暂无中期记忆）"
+    )
+    midterm_row_id = int(row[0]) if row and row[0] is not None else None
+
+    prompt_template = build_prompt_on_demand("memory_midterm_merge")
+    if not prompt_template:
+        return {"success": False, "error": "未找到 memory_midterm_merge 提示词"}
+
+    system_prompt = (
+        prompt_template.replace("{existing_midterm}", existing).replace(
+            "{new_session_points}", new_session_points
+        )
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": "请输出更新后的完整中期记忆列表（每条一行，格式 A. xxx）。",
+        },
+    ]
+
+    try:
+        merged = _memory_chat(messages)
+    except Exception as e:
+        return {"success": False, "error": f"LLM调用失败: {e}"}
+
+    if not merged or not str(merged).strip():
+        return {"success": False, "error": "LLM返回为空"}
+
+    content = str(merged).strip()
+
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            if midterm_row_id is not None:
+                cur.execute(
+                    """
+                    UPDATE business.ai_memory
+                    SET content = %s, updated_at = NOW()
+                    WHERE id = %s AND user_id = %s AND scope = 'midterm'
+                    """,
+                    (content, midterm_row_id, user_id),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO business.ai_memory (user_id, scope, content, source_session_id)
+                    VALUES (%s, 'midterm', %s, NULL)
+                    """,
+                    (user_id, content),
+                )
+        conn.commit()
+
+    return {"success": True, "user_id": user_id}
 
 
 def maybe_clean_previous_session(user_id: int, current_session_id: int) -> Dict[str, Any]:
     """
     在新会话任意一轮对话请求前调用：若**上一会话**在 ai_chat 中有记录、
     但尚未有 ai_memory(scope=session, source_session_id=该会话)，则同步执行
-    clean_session 一次。随后 build_prompt 的「今日记录」会自然带上该要点。
+    clean_session 一次。随后 merge_midterm 会把该要点并入中期记忆。
 
-    与 compress_longterm（长记忆）无关；长记忆整理方式不变。
+    清洗成功后会在 clean_session 内触发 merge_midterm，与 longterm 压缩独立。
     """
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -343,10 +434,10 @@ def extract_core_facts(user_id: int) -> Dict[str, Any]:
 
 def compress_longterm(user_id: int) -> Dict[str, Any]:
     """
-    长期记忆压缩：将当日 session 要点与旧 longterm 合并压缩。
+    长期记忆压缩：将中期记忆（midterm，已合并去矛盾）与旧 longterm 合并压缩。
 
     流程：
-    1. 从 ai_memory 读取该用户今日所有 session 要点
+    1. 从 ai_memory 读取该用户 scope=midterm 的完整内容（一人一条）
     2. 从 ai_memory 读取现有 longterm 记忆
     3. 拉取 memory_longterm_compress 提示词
     4. 调 LLM 压缩合并
@@ -357,13 +448,13 @@ def compress_longterm(user_id: int) -> Dict[str, Any]:
             cur.execute(
                 """
                 SELECT content FROM business.ai_memory
-                WHERE user_id = %s AND scope = 'session'
-                AND created_at >= CURRENT_DATE
-                ORDER BY created_at
+                WHERE user_id = %s AND scope = 'midterm'
+                ORDER BY updated_at DESC
+                LIMIT 1
                 """,
                 (user_id,),
             )
-            session_rows = cur.fetchall()
+            mid_row = cur.fetchone()
 
             cur.execute(
                 """
@@ -375,8 +466,10 @@ def compress_longterm(user_id: int) -> Dict[str, Any]:
             )
             longterm_row = cur.fetchone()
 
-    today_sessions = (
-        "\n\n".join(r[0] for r in session_rows) if session_rows else "（今日无新记录）"
+    midterm_text = (
+        str(mid_row[0]).strip()
+        if mid_row and mid_row[0]
+        else "（暂无中期记忆）"
     )
     existing_longterm = longterm_row[1] if longterm_row else "（暂无长期记忆）"
 
@@ -384,8 +477,10 @@ def compress_longterm(user_id: int) -> Dict[str, Any]:
     if not prompt_template:
         return {"success": False, "error": "未找到 memory_longterm_compress 提示词"}
 
-    system_prompt = prompt_template.replace("{today_sessions}", today_sessions).replace(
-        "{existing_longterm}", existing_longterm
+    system_prompt = (
+        prompt_template.replace("{midterm_memories}", midterm_text)
+        .replace("{today_sessions}", midterm_text)
+        .replace("{existing_longterm}", existing_longterm)
     )
 
     messages = [

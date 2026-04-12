@@ -14,6 +14,7 @@ import re
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from psycopg2 import errors as pg_errors
 from psycopg2 import sql
 
 from engine.query_engine import (
@@ -30,6 +31,10 @@ _BLOCKED_IN_DATA = frozenset(
 )
 
 _OPS = frozenset({"create", "update", "delete"})
+
+# 可选：按 PostgreSQL 外键约束名覆盖「请先在【YYY】…」中的展示名（缺省用 meta.meta_tables.table_cn）
+# 可由 build_fk_hint_map_from_db() 根据 information_schema / pg_constraint 预填
+FK_HINT_MAP: Dict[str, str] = {}
 
 
 def _ok(operation: str, table: str, row_id: int) -> Dict[str, Any]:
@@ -447,3 +452,132 @@ def _execute_delete(
     if cur.rowcount != 1:
         return _fail("软删除失败：记录不存在或已被删除")
     return _ok("delete", table, rid)
+
+
+# --- 写库异常业务化翻译（供 sql_engine 确认执行层使用；不改动查询逻辑） ---
+
+
+def _fk_operation_label(pgerror: str) -> str:
+    """从 PostgreSQL 主错误行推断操作动词（不含「失败」）。"""
+    low = (pgerror or "").lower()
+    if "delete on table" in low:
+        return "删除"
+    if "insert or update on table" in low or "insert or update" in low:
+        return "保存"
+    if "update on table" in low:
+        return "更新"
+    if "insert on table" in low:
+        return "新建"
+    return "操作"
+
+
+def _ref_table_from_constraint_name(cur, constraint_name: str) -> Optional[str]:
+    """由 pg 外键约束名解析被引用表（无 schema 前缀的 relname）。"""
+    if not constraint_name or cur is None:
+        return None
+    cur.execute(
+        """
+        SELECT rel2.relname
+        FROM pg_constraint c
+        JOIN pg_class rel2 ON rel2.oid = c.confrelid
+        WHERE c.conname = %s AND c.contype = 'f'
+        LIMIT 1
+        """,
+        (constraint_name,),
+    )
+    row = cur.fetchone()
+    return str(row[0]) if row and row[0] else None
+
+
+def _parse_fk_violation_detail(detail: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    解析 DETAIL: Key (col)=(val) is not present in table "ref".
+    返回 (key列, 值, 被引用表名)。
+    """
+    if not detail:
+        return None, None, None
+    m = re.search(
+        r'Key \(([^)]+)\)=\((.*)\)\s+is not present in table "([^"]+)"',
+        detail,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if not m:
+        return None, None, None
+    return m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+
+
+def _build_fk_user_message(exc: BaseException, cur) -> Optional[str]:
+    """构造外键业务提示；无法解析时返回 None 交由上层按 unknown 处理。"""
+    diag = getattr(exc, "diag", None)
+    pgerror = getattr(exc, "pgerror", None) or str(exc)
+    detail = (getattr(diag, "message_detail", None) or "").strip()
+    constraint_name = getattr(diag, "constraint_name", None) if diag else None
+
+    _cols, bad_val, ref_table = _parse_fk_violation_detail(detail)
+    if not ref_table and constraint_name and cur is not None:
+        ref_table = _ref_table_from_constraint_name(cur, constraint_name)
+    if not ref_table:
+        return None
+
+    if constraint_name and constraint_name in FK_HINT_MAP:
+        yyy = FK_HINT_MAP[constraint_name]
+    elif cur is not None:
+        yyy = _load_table_label(cur, ref_table)
+    else:
+        yyy = ref_table
+
+    op = _fk_operation_label(pgerror)
+    val_disp = bad_val if bad_val else "关联值"
+    return (
+        f"{op}失败：系统中不存在 [{val_disp}]，请先在【{yyy}】中建立对应记录"
+    )
+
+
+def translate_db_write_exception(exc: BaseException, cur) -> Dict[str, Any]:
+    """
+    将 PostgreSQL 写操作异常转为统一结构（确认执行层返回给编排 / LLM）。
+
+    - dependency_missing：外键，message 为业务中文
+    - duplicate：唯一约束 / 重复键
+    - unknown：其余，message 为原始错误文本
+    """
+    raw = str(exc).strip()
+
+    def _out(error_type: str, message: str) -> Dict[str, Any]:
+        return {
+            "success": False,
+            "error_type": error_type,
+            "message": message,
+            "error": message,
+        }
+
+    if isinstance(exc, pg_errors.UniqueViolation):
+        return _out("duplicate", "该记录已存在，请勿重复操作")
+    if isinstance(exc, pg_errors.ForeignKeyViolation):
+        msg = _build_fk_user_message(exc, cur)
+        if msg:
+            return _out("dependency_missing", msg)
+        return _out("unknown", raw)
+    return _out("unknown", raw)
+
+
+def build_fk_hint_map_from_db(cur) -> Dict[str, str]:
+    """
+    根据当前库中全部外键约束，预填「约束名 -> 被引用表中文名」。
+    便于维护 FK_HINT_MAP；可在迁移或启动时调用一次写回配置。
+    """
+    out: Dict[str, str] = {}
+    cur.execute(
+        """
+        SELECT c.conname, rel2.relname
+        FROM pg_constraint c
+        JOIN pg_class rel2 ON rel2.oid = c.confrelid
+        WHERE c.contype = 'f'
+        ORDER BY c.conname
+        """
+    )
+    for conname, relname in cur.fetchall() or []:
+        if not conname or not relname:
+            continue
+        out[str(conname)] = _load_table_label(cur, str(relname))
+    return out

@@ -28,6 +28,7 @@ from psycopg2.extras import RealDictCursor
 from tools.database import db_conn
 
 from engine.incident_logger import is_audit_permission_only, log_incident
+from engine.write_engine import translate_db_write_exception
 
 
 def _cursor_execute(cur, sql: str, params: List[Any]) -> None:
@@ -386,6 +387,9 @@ def _add_table_raw(name: str, found: Set[str]) -> None:
     name = name.strip().strip('"')
     if not name or name.upper() in ("SELECT", "WHERE", "ON", "AND", "OR", "AS"):
         return
+    # SUBSTRING(x FROM 4) 等误捕获时可能只剩纯数字，不是表名
+    if name.isdigit():
+        return
     if "." in name:
         a, b = name.split(".", 1)
         found.add(f"{a.lower()}.{b.lower()}")
@@ -396,7 +400,7 @@ def _add_table_raw(name: str, found: Set[str]) -> None:
 def _collect_tables_from_statement(stmt: Statement) -> Set[str]:
     """尽力收集 FROM/JOIN/INTO/UPDATE/DELETE 涉及的表名（小写 schema.table）。"""
     found: Set[str] = set()
-    sql = str(stmt)
+    sql = _mask_sql_function_internal_from_clauses(str(stmt))
 
     for m in re.finditer(
         r"\b(?:FROM|JOIN)\s+([\"]?[\w]+[\"]?(?:\.[\"]?[\w]+[\"]?)?)",
@@ -646,6 +650,33 @@ def _balanced_paren_end(s: str, open_at: int) -> int:
                 return i
         i += 1
     return -1
+
+
+def _mask_sql_function_internal_from_clauses(sql: str) -> str:
+    """
+    屏蔽 SUBSTRING(x FROM …)、EXTRACT(… FROM …)、OVERLAY(… FROM …)、TRIM(… FROM …)
+    等函数括号内的 FROM，避免被 FROM/JOIN 表名正则误识别（如 business.4）。
+    """
+    pat = re.compile(r"\b(SUBSTRING|OVERLAY|EXTRACT|TRIM)\s*\(", re.IGNORECASE)
+    pos = 0
+    s = sql
+    while True:
+        m = pat.search(s, pos)
+        if not m:
+            return s
+        open_idx = m.end() - 1
+        if open_idx >= len(s) or s[open_idx] != "(":
+            return s
+        close_idx = _balanced_paren_end(s, open_idx)
+        if close_idx < 0:
+            return s
+        inner = s[open_idx + 1 : close_idx]
+        inner_masked = re.sub(r"\bFROM\b", " __FROM_MASK__ ", inner, flags=re.IGNORECASE)
+        if inner_masked == inner:
+            pos = close_idx + 1
+            continue
+        s = s[: open_idx + 1] + inner_masked + s[close_idx:]
+        pos = open_idx + 1
 
 
 def _split_top_level_commas(inner: str) -> List[str]:
@@ -955,6 +986,7 @@ def _confirm_write_single(
     if st not in ("INSERT", "UPDATE", "DELETE"):
         return {"success": False, "error": "仅支持 INSERT/UPDATE/DELETE"}
 
+    cur = None
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
         _cursor_execute(cur, sql.strip(), params)
@@ -991,7 +1023,7 @@ def _confirm_write_single(
             generated_sql=sql,
             context={"fn": "_confirm_write_single"},
         )
-        return {"success": False, "error": str(e)}
+        return translate_db_write_exception(e, cur)
 
 
 def confirm_batch_sql(
@@ -1029,7 +1061,9 @@ def confirm_batch_sql(
             user_id=user_id,
             context={"fn": "confirm_batch_sql", "phase": "commit"},
         )
-        return {"success": False, "error": str(e), "results": results}
+        with conn.cursor() as c_commit:
+            tr = translate_db_write_exception(e, c_commit)
+        return {**tr, "results": results}
     return {"success": True, "results": results, "count": len(results)}
 
 

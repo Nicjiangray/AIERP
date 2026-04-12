@@ -10,7 +10,7 @@ from typing import List, Optional
 
 from tools.database import db_conn
 
-# 主助手注入记忆总长度上限；超出时先裁 session，再裁 longterm，core 不裁（可用环境变量覆盖）
+# 主助手注入记忆总长度上限；超出时先裁 midterm，再裁 longterm，core 不裁（可用环境变量覆盖）
 _MEMORY_INJECT_MAX_CHARS = int(os.environ.get("MEMORY_INJECT_MAX_CHARS") or "12000")
 
 _CORE_HEADER = (
@@ -97,25 +97,26 @@ def _trim_end(s: str, max_len: int) -> str:
     return s[: max_len - 1].rstrip() + "…"
 
 
-def _pack_memory(core_text: str, longterm_text: str, session_text: str) -> str:
+def _pack_memory(core_text: str, longterm_text: str, midterm_text: str) -> str:
     parts: list[str] = []
     if core_text.strip():
         parts.append(_CORE_HEADER + core_text.strip())
     if longterm_text.strip():
         parts.append("【长期记忆】\n" + longterm_text.strip())
-    if session_text.strip():
-        parts.append("【近期要点】\n" + session_text.strip())
+    if midterm_text.strip():
+        parts.append("【中期记忆】\n" + midterm_text.strip())
     return "\n\n".join(parts)
 
 
 def _load_user_memory(user_id: int) -> str:
     """
     从 business.ai_memory 拉取用户记忆。
-    顺序：core → longterm → session；超长时先裁 session 正文，再裁 longterm 正文，core 正文不裁。
+    顺序：core → longterm → midterm（不注入原始 session 行）。
+    超长时先裁 midterm 正文，再裁 longterm 正文，core 正文不裁。
     """
     core_lines: list[str] = []
     longterm_body = ""
-    session_lines: list[str] = []
+    midterm_body = ""
 
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -146,36 +147,34 @@ def _load_user_memory(user_id: int) -> str:
             cur.execute(
                 """
                 SELECT content FROM business.ai_memory
-                WHERE user_id = %s AND scope = 'session'
-                AND created_at >= CURRENT_DATE
-                ORDER BY created_at
+                WHERE user_id = %s AND scope = 'midterm'
+                ORDER BY updated_at DESC LIMIT 1
                 """,
                 (user_id,),
             )
-            for r in cur.fetchall():
-                if r and r[0] and str(r[0]).strip():
-                    session_lines.append(str(r[0]).strip())
+            mrow = cur.fetchone()
+            if mrow and mrow[0]:
+                midterm_body = str(mrow[0]).strip()
 
     core_text = "\n".join(core_lines)
-    session_text = "\n".join(session_lines)
 
-    packed = _pack_memory(core_text, longterm_body, session_text)
+    packed = _pack_memory(core_text, longterm_body, midterm_body)
     if not packed:
         return ""
     if len(packed) <= _MEMORY_INJECT_MAX_CHARS:
         return packed
 
-    # core 不裁；先减 session，再减 longterm
-    se = session_text
+    # core 不裁；先减 midterm，再减 longterm
+    mt = midterm_body
     lt = longterm_body
     budget = _MEMORY_INJECT_MAX_CHARS
     cur_pack = packed
     for _ in range(200):
-        cur_pack = _pack_memory(core_text, lt, se)
+        cur_pack = _pack_memory(core_text, lt, mt)
         if len(cur_pack) <= budget:
             return cur_pack
-        if se:
-            se = _trim_end(se, max(0, len(se) - max(80, len(se) // 4)))
+        if mt:
+            mt = _trim_end(mt, max(0, len(mt) - max(80, len(mt) // 4)))
             continue
         if lt:
             lt = _trim_end(lt, max(0, len(lt) - max(80, len(lt) // 4)))

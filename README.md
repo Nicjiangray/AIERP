@@ -209,12 +209,80 @@
 
 ---
 
+### V8：多步任务修复 + 中记忆层（2026-04-12）
+
+**Orchestrator / confirm 修复**
+
+- **`type: done` 识别修复**：tool_expert 返回 `{"type": "done", ...}` 时不再报「未知指令类型」；新增 `_expert_payload_is_done(payload)` 同时识别 `type=done` 与 `done=true` 两种写法。
+- **`/ai/confirm` 回注主助手**：confirm 成功/失败后，将结构化 `[TOOL_RESULT]`（含实际 `returning` 数据）写入 `ai_chat(role=tool)`，再调用主助手续写，写入 `ai_chat(role=assistant)`；响应新增 `assistant_reply` 字段；前端 `AiPanel.vue` 优先展示 `assistant_reply`。主助手据此可自动推进多步任务，不再写死「已完成」结束语。
+
+**write_engine 异常翻译**
+
+- `write_engine.py` 新增 `translate_db_write_exception(exc, cur)`：`ForeignKeyViolation` → `dependency_missing`（中文业务说明）；`UniqueViolation` → `duplicate`；其余 → `unknown`。`sql_engine._confirm_write_single` 在 except 中统一调用。
+
+**tool_expert prompt 新规则（`tool_expert_executor`）**
+
+- **禁止越权补建主数据**（v28）：发现依赖记录不存在时，立即 `type: done, success: false`，不得自行创建关联记录。
+- **编号查最大值**（v29）：自动生成编号类字段（工号、单号等）前，先用 `SELECT MAX(...)` 查已有最大值 +1，只需一次查询，不循环重试。
+
+**SQL 审计器修复**
+
+- `sql_engine.py` 表名提取逻辑：排除 `SUBSTRING(col FROM n)` 和 `EXTRACT(field FROM col)` 函数内的 `FROM`，避免数字被误识别为表名（如 `business.4`）。
+
+**记忆系统重构：新增中记忆层**
+
+- 记忆层级从三层扩展为**四层**：`session → midterm（中记忆）→ longterm → core`
+- `scope=midterm`：每次 `clean_session` 成功后立即调用 `merge_midterm`，将新 session 要点与已有中记忆合并（LLM 去矛盾、去重），每用户一条记录，不压缩。
+- 提示词注入顺序改为 **core → longterm → midterm**，不再注入原始 session，解决 token 膨胀和旧信息污染问题。
+- `compress_longterm` 原料改为 `scope=midterm`。
+- `GET /ai/memory` 的 `scope` 参数新增支持 `midterm`。
+- `memory_session_clean` 提示词新增规则：提取执行失败的操作及其原因，使踩坑经验能沉淀进长记忆和核心事实。
+
+**相关迁移**
+
+| 文件 | 作用 |
+|------|------|
+| `v28_tool_expert_no_auto_create_dependency.sql` | tool_expert 禁止越权补建主数据 |
+| `v29_tool_expert_auto_number_max_before_write.sql` | tool_expert 编号生成前查最大值 |
+| `v30_memory_midterm.sql` | `ai_memory.scope` 增加 `midterm`；插入 `memory_midterm_merge` prompt；更新 `memory_longterm_compress` 占位符 |
+
+---
+
+### V9：多步任务状态机（`[PLAN]` + `ai_tasks`）（2026-04-12）
+
+将「依赖前置数据的多步操作」的规划与执行状态落在库表，由 **`main.py` orchestrator** 与 **`/ai/confirm`** 读写；主助手通过 **`[TASK_STATUS]`** 文本（由代码注入，**不**写入 `ai_chat`）感知进度；**tool_expert 不直接见 `ai_tasks` 表**（`include_in_domain_model = false`）。
+
+**表与迁移**
+
+- **`business.ai_tasks`**：会话级任务（`session_id`、`user_id`、`status`、`original_intent`、`plan` JSONB、`current_step`、`replan_count` / `max_replans`、`final_summary` 等）。迁移 **`v31_ai_tasks.sql`**（建表、索引、注释；内含 **`CALL meta.sync_constitution()`** 及将 **`ai_tasks`** 标为 **`include_in_domain_model = false`**）。
+- **`role_rules` 追加 [PLAN] 规则**：多步任务须在同一次回复中先输出 **`[PLAN]`** 再输出第一步 **`[TOOL]`**；迁移 **`v32_role_rules_plan_block.sql`**（`UPDATE meta.prompts` 拼接正文）。
+
+**代码**
+
+- **`engine/task_manager.py`**：`get_active_task` / `create_task` / `update_step_result` / `advance_step` / `replan_task` / `complete_task` / `fail_task`；`format_task_context`（生成 **`[TASK_STATUS]`**）；`parse_plan`（解析 **`[PLAN]`**）。使用 **asyncpg** 连接池（与 **`psycopg2`** 的 `db_conn()` 并行）。
+- **`main.py`**：
+  - **`/ai/chat`**：主助手完整回复后若含 **`[PLAN]`**，则 `parse_plan` → `create_task` → 从下发与落库正文中去掉 **`[PLAN]...[/PLAN]`**（SSE 侧通过 **`_strip_plan_for_stream_visible`** 与 **`_user_visible_stream_prefix`** 一致过滤）。
+  - 应用生命周期内维护 **`_task_pg_pool`**（asyncpg），供 `task_manager` 使用。
+  - **`/ai/confirm`**（**`_confirm_persist_tool_then_assistant`**）：在写入 **`[TOOL_RESULT]`** 的 `ai_chat(role=tool)` 之后、主助手续写之前，若有活跃任务则按 confirm 成功/失败更新 **`plan` 中当前步**、必要时 **`advance_step`**，并将 **`[TASK_STATUS]`** 拼入**本轮**发给主助手的 user 内容（仍不单独落库）；主助手续写返回后再解析 **`[PLAN]`**（重规划 **`replan_task`** / 超限 **`fail_task`**）、**`[TOOL]`**（不改表）或纯文本（**`complete_task`** / **`fail_task`**）。
+- **依赖**：根目录 **`requirements.txt`** 含 **`asyncpg`**。
+
+**执行迁移（示例）**
+
+```bash
+psql -U nicjiang -d aierp -f constitution/v31_ai_tasks.sql
+psql -U nicjiang -d aierp -f constitution/v32_role_rules_plan_block.sql
+```
+
+**云端同步**：库执行 v31 / v32 后部署代码并重启服务（按运维流程）。
+
+---
+
 ## 项目目录结构概览
 
 ```
 aierp/
-├── main.py                 # FastAPI：表 CRUD、/auth/*、/api/user-menu、/api/dashboard、/approvals/*、/ai/chat（orchestrator+[TOOL]）、/ai/chat/log-message、/ai/memory/*、/ai/confirm、/ai/feedback*
-├── engine/                 # sql_engine、prompt_builder、memory_manager、incident_logger；query/write_engine 已 deprecated
+├── main.py                 # FastAPI：表 CRUD、/auth/*、/api/user-menu、/api/dashboard、/approvals/*、/ai/chat（orchestrator+[PLAN]/[TOOL]、V9 任务池）、/ai/chat/log-message、/ai/memory/*、/ai/confirm、/ai/feedback*
+├── engine/                 # sql_engine、prompt_builder、memory_manager、incident_logger、task_manager；query/write_engine 已 deprecated
 ├── llm/                    # OpenAI 兼容客户端（chat / 流式 / 附件解析）；intent 为占位
 ├── tools/                  # 连接池、通用 DB 读写与会话 memo 等辅助
 ├── scripts/                # sync_meta_pipeline、sync_meta_cn、sync_schema_shadow、daily_report
@@ -247,7 +315,8 @@ aierp/
 | `query_engine.py` | 旧版：结构化 payload + 白名单的受控 SELECT（`execute_query`） | **deprecated**：不再被 `/ai/chat` 主链路使用；保留文件供对照或迁移 |
 | `write_engine.py` | 旧版：结构化 payload 的预览与写入 | **deprecated**：同上 |
 | `prompt_builder.py` | 统一 prompt 拼装：按 `agent_role` 取 `meta.prompts` + 按 `user_id` 取 `ai_memory` | **已完成**：`assistant` / `tool_expert` / `memory_manager` |
-| `memory_manager.py` | 记忆管理员：`clean_session()`、`compress_longterm()` | **已完成**：手动 API 触发 |
+| `memory_manager.py` | 记忆管理员：`clean_session()`、`compress_longterm()`、`merge_midterm()`（中记忆合并） | **已完成**：手动 API 触发 |
+| **`task_manager.py`** | **V9**：`business.ai_tasks` 读写、**`[TASK_STATUS]`** 文本、`parse_plan`；供 **`main.py`** orchestrator 与 confirm 路径调用（asyncpg） | **已完成** |
 | `incident_logger.py` | 系统错误记录：`log_incident()` | **已完成**：在 `sql_engine` / `main.py` 各 except 块调用 |
 
 ---
@@ -270,13 +339,13 @@ aierp/
 | `/table/{schema}/{table_name}/{row_id}` | DELETE | 硬删除一行 | 可用 |
 | **`/auth/login`** | **POST** | **body：`{ login_name, password }`**；bcrypt 校验 **`business.user_accounts`**；返回 **`user`**（`id`=`employees.id`） | 可用 |
 | **`/auth/me`** | **GET** | **Query：`user_id`**（员工 id）；返回 **`{ user: {...} }`**，不存在则 404 | 可用 |
-| `/ai/confirm` | POST | 执行经 **`preview_sql`** 审核的写 SQL：`payload` 含 **`batch`** 或单条 **`sql`/`params`**；可选 **`session_id`** 将成功/失败收尾句写入 **`ai_chat`** | 可用 |
+| `/ai/confirm` | POST | 执行经 **`preview_sql`** 审核的写 SQL：`payload` 含 **`batch`** 或单条 **`sql`/`params`**；可选 **`session_id`**：写入 **`[TOOL_RESULT]`** 后**主助手续写**（**V9**：若有活跃 **`ai_tasks`** 则注入 **`[TASK_STATUS]`** 并推进步骤 / 解析续写结果） | 可用 |
 | `/ai/chat/log-message` | POST | 将一条 **`assistant` / `user` / `tool` / `system`** 消息追加写入 **`ai_chat`**（如取消写入、终止流、前端异常提示） | 可用 |
-| `/ai/chat` | POST | **双层 orchestrator**：`build_prompt('assistant', user_id)` + 主模型（默认 **`chat`/`chat_stream`**，可选 **`inviteExpert: true`** → **`chat_expert_only`**）；若回复含 **`[TOOL]`** → **`_call_tool_expert`**（内层多步 **`execute_sql`/`preview_sql`**，见上节）；**SSE** 默认；**`user_id`** 时建 **`ai_sessions`** 并写 **`ai_chat`** | 可用 |
+| `/ai/chat` | POST | **双层 orchestrator**：`build_prompt('assistant', user_id)` + 主模型（默认 **`chat`/`chat_stream`**，可选 **`inviteExpert: true`** → **`chat_expert_only`**）；若回复含 **`[PLAN]`**（**V9**）则解析并 **`create_task`**、正文过滤 **`[PLAN]`**；若含 **`[TOOL]`** → **`_call_tool_expert`**（内层多步 **`execute_sql`/`preview_sql`**，见上节）；**SSE** 默认；**`user_id`** 时建 **`ai_sessions`** 并写 **`ai_chat`** | 可用 |
 | `/ai/memory/clean-session` | POST | 手动触发 session 清洗，要点写入 `business.ai_memory`（`scope=session`） | 可用（body：`{"session_id": <int>}`） |
 | `/ai/memory/compress-longterm` | POST | 手动触发长期记忆压缩，覆盖/写入 `scope=longterm`；成功后**顺带**调用 `extract_core_facts` 更新 `scope=core` | 可用（body：`{"user_id": <int>}`） |
 | `/ai/memory/extract-core` | POST | 仅提炼核心经验（写入 `scope=core`） | 可用（body：`{"user_id": <int>}`） |
-| `/ai/memory` | GET | `user_id` + `scope`（`core` \| `longterm`）列记忆行 | 可用 |
+| `/ai/memory` | GET | `user_id` + `scope`（`core` \| `longterm` \| `midterm`）列记忆行 | 可用 |
 | `/ai/memory` | POST | 新增一条 `core` 或 `longterm`：`{ user_id, scope, content }` | 可用 |
 | `/ai/memory/{id}` | PATCH | 更新内容：`{ user_id, content }`（仅 `core`/`longterm`） | 可用 |
 | `/ai/memory/{id}` | DELETE | `?user_id=` 与记录一致时删除 | 可用 |
@@ -332,7 +401,7 @@ aierp/
 ## 环境与启动
 
 - **Python**：项目根目录使用虚拟环境 `.venv`（`source .venv/bin/activate`）。
-- **依赖（V5 相关）**：`bcrypt`（登录）、`sqlparse`（`sql_engine` 审计），见根目录 **`requirements.txt`**。
+- **依赖（V5 相关）**：`bcrypt`（登录）、`sqlparse`（`sql_engine` 审计）、**`asyncpg`**（**V9** `task_manager` / **`main.py`** 任务池），见根目录 **`requirements.txt`**。
 - **数据库**：默认 `psql -U nicjiang -d aierp`（可用 `PGUSER` / `PGDATABASE` 覆盖）。
 - **一键前后端**：`./dev.sh`（根目录执行；否则可能加载不到本仓库的 `main.py`）。
 - **仅后端**：`.venv/bin/python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000`
@@ -410,6 +479,11 @@ aierp/
 | **`v25_nav_payments_warehouse_read.sql`** | **V7+**：`warehouse` 补 **`business.payments`** 读权限（v17 遗漏）；保证侧栏出现收付款 |
 | **`v26_nav_run_order_main_only.sql`** | **V7+**：侧栏**仅主表**；`prep` 含**联系人**；`run` 以**合同管理**（`contracts`）为首→变更→采购→收付款→到货→发货→库存；**`/api/user-menu`** 排除子表导航 |
 | **`v27_nav_contacts_prep_contracts_first_run.sql`** | **V7+**：曾执行**旧** v26 的库：联系人回 prep、`contracts` 置顶 run |
+| **`v28_tool_expert_no_auto_create_dependency.sql`** | **V8**：tool_expert 禁止越权补建主数据 |
+| **`v29_tool_expert_auto_number_max_before_write.sql`** | **V8**：tool_expert 编号生成前查最大值（MAX+1，单次查询） |
+| **`v30_memory_midterm.sql`** | **V8**：中记忆层（`scope=midterm`）+ `memory_midterm_merge` prompt |
+| **`v31_ai_tasks.sql`** | **V9**：**`business.ai_tasks`** 任务状态机表；**`include_in_domain_model = false`** |
+| **`v32_role_rules_plan_block.sql`** | **V9**：**`role_rules`** 追加多步任务 **`[PLAN]`** 格式与触发规则 |
 
 执行示例：
 
@@ -424,8 +498,9 @@ psql -U nicjiang -d aierp -f constitution/create_meta_prompts.sql
 ## 容易混的表（心智模型）
 
 - **`meta.prompts`**：所有注入 LLM 的提示词模块；字段 **`agent_role`** 区分归属。`inject_mode`：`always` = 拼装进 `build_prompt(agent_role)`，`on_demand` = 仅 `build_prompt_on_demand(prompt_code)`（如记忆清洗/压缩脚本）。
-- **`business.ai_memory`**：用户级 AI 记忆（`scope`：`session` / `longterm`），`source_session_id` 可选指向 **`business.ai_sessions`**。
+- **`business.ai_memory`**：用户级 AI 记忆（`scope`：`session` / `midterm` / `longterm` / `core`），`source_session_id` 可选指向 **`business.ai_sessions`**。
 - **`business.ai_sessions` / `business.ai_chat`**：对话会话与消息原文；持久化由 `/ai/chat` 在提供 `user_id` 时写入。
+- **`business.ai_tasks`**：**V9** 多步任务状态（`plan` JSONB、当前步、重规划次数等）；**`include_in_domain_model = false`**，由代码与 **`task_manager`** 维护，**不**注入 tool_expert。
 - **`meta.role_permissions`**：角色→表级权限矩阵，**R7** 校验用。
 - **`business.user_permissions`**：个人级权限覆盖，优先于角色默认。
 - **`meta.approval_rules`**：审批规则配置（`target_type` → `approver_role`）。
@@ -447,6 +522,7 @@ psql -U nicjiang -d aierp -f constitution/create_meta_prompts.sql
 | `tool_write` | tool_expert | **V5 停用**（`is_active=false`）：旧版结构化 write 说明，由 SQL 路径取代 |
 | `memory_session_clean` | memory_manager | 会话清洗（on_demand） |
 | `memory_longterm_compress` | memory_manager | 长期压缩（on_demand） |
+| `memory_midterm_merge` | memory_manager | 中记忆合并（on_demand）：将新 session 要点合并进中记忆，去矛盾去重 |
 
 > **`build_prompt('tool_expert')`** 只加载 **`is_active = TRUE`** 且 **`inject_mode = 'always'`** 的片段，因此停用的 **`tool_query` / `tool_write`** 不会进入 expert 的 system prompt；典型注入组合为 **`schema_shadow` + `tool_expert_executor`**。
 

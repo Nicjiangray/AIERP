@@ -445,6 +445,17 @@ function writePreviewExpertExplanation(wp) {
   const t = wp?.expert_explanation ?? wp?.payload?.expert_explanation
   return t != null && String(t).trim() !== '' ? String(t).trim() : ''
 }
+
+/** 与后端 ai_chat 落库一致：在 SSE 仅下发简短提示时，把卡片摘要并入正文，确认后仍可见 */
+function appendWritePreviewTextToContent(base, payload) {
+  const summary = (payload?.summary || '').trim()
+  const expert = (payload?.expert_explanation || '').trim()
+  const parts = []
+  if (summary) parts.push(`操作确认\n${summary}`)
+  if (expert) parts.push(`操作说明\n${expert}`)
+  if (!parts.length) return base || ''
+  return `${base || ''}\n\n${parts.join('\n\n')}`
+}
 import { useAuthStore } from '../stores/auth'
 import { API_BASE } from '@/config/api'
 
@@ -659,12 +670,17 @@ async function confirmWritePreview(idx) {
     messages.value[idx] = { ...m, writePreview: null }
     let line
     if (data.success) {
-      const vm = typeof data.verify_message === 'string' ? data.verify_message.trim() : ''
-      line = vm ? `✅ ${vm}` : '✅ 已经按照您的要求完成任务。'
+      const ar =
+        typeof data.assistant_reply === 'string' ? data.assistant_reply.trim() : ''
+      line = ar || '写入已执行。'
     } else {
-      line = data.task_failed
-        ? `❌ ${data.error || '任务失败'}`
-        : `❌ 执行失败：${data.error || '未知错误'}`
+      const arFail =
+        typeof data.assistant_reply === 'string' ? data.assistant_reply.trim() : ''
+      line =
+        arFail ||
+        (data.task_failed
+          ? `❌ ${data.error || '任务失败'}`
+          : `❌ 执行失败：${data.error || '未知错误'}`)
     }
     messages.value.push({ role: 'assistant', content: line })
     await scrollToBottom()
@@ -1156,6 +1172,7 @@ async function sendMessage(text) {
         const cur = messages.value[state.assistantIdx]
         messages.value[state.assistantIdx] = {
           ...cur,
+          content: appendWritePreviewTextToContent(cur.content || '', payload),
           writePreview: {
             summary: payload.summary || '',
             expert_explanation: payload.expert_explanation,
@@ -1378,6 +1395,7 @@ async function confirmOperation() {
         const cur = messages.value[state.assistantIdx]
         messages.value[state.assistantIdx] = {
           ...cur,
+          content: appendWritePreviewTextToContent(cur.content || '', payload),
           writePreview: {
             summary: payload.summary || '',
             expert_explanation: payload.expert_explanation,

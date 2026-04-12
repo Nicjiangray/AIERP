@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import asyncio
+import asyncpg
 import io
 import json
 import logging
@@ -53,6 +54,20 @@ from llm.client import (
     chat_stream,
     parse_file,
 )
+from engine.task_manager import (
+    advance_step,
+    all_steps_completed,
+    complete_task,
+    create_task,
+    fail_task,
+    format_task_context,
+    get_active_task,
+    is_last_step,
+    parse_plan,
+    replan_limit_reached,
+    replan_task,
+    update_step_result,
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -62,6 +77,9 @@ if not logger.handlers:
     _orch_h.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
     logger.addHandler(_orch_h)
 logger.propagate = False
+
+# asyncpg 池：供 engine.task_manager（business.ai_tasks）使用，与 psycopg2 的 db_conn 并行
+_task_pg_pool: Optional[asyncpg.Pool] = None
 
 # --- 外层 orchestrator（与内层 expert 步数无关，勿混用）---
 # 主助手每轮回复 ↔ 解析 [TOOL] ↔ 调一次 _call_tool_expert（内层另有 MAX_EXPERT_STEPS）的上限。
@@ -128,19 +146,48 @@ def _extract_tool_block(text: str) -> Optional[Dict[str, str]]:
     return block
 
 
+def _strip_plan_for_stream_visible(full_reply: str) -> str:
+    """
+    从累积正文中去掉 [PLAN]...[/PLAN]（闭合则删块；仅出现 [PLAN] 未闭合则截断到其前），
+    供 SSE 与最终可见文本一致。
+    """
+    if not full_reply:
+        return full_reply
+    text = full_reply
+    while True:
+        pi = text.find("[PLAN]")
+        if pi < 0:
+            break
+        end = text.find("[/PLAN]", pi)
+        if end < 0:
+            return text[:pi].rstrip()
+        text = text[:pi] + text[end + len("[/PLAN]") :]
+    return text
+
+
 def _user_visible_stream_prefix(full_reply: str) -> str:
     """
-    SSE 发给用户可见的文本：不包含 [TOOL] 块内原文，也不包含 [/TOOL] 之后同轮编造内容。
+    SSE 发给用户可见的文本：不包含 [PLAN]...[/PLAN]；不包含 [TOOL] 块内原文，也不包含 [/TOOL] 之后同轮编造内容。
     若已出现 [TOOL] 但未闭合，只展示 [TOOL] 之前的部分（块内缓冲不下发）。
+    若流式片段中仅出现不完整的「[TOOL」（尚未写出闭合 ]），也截断在该标记之前，避免把「[TOOL」字样下发给用户。
     """
+    if not full_reply:
+        return full_reply
+    full_reply = _strip_plan_for_stream_visible(full_reply)
+    if not full_reply:
+        return full_reply
     low = full_reply.lower()
     ti = low.find("[tool]")
-    if ti < 0:
-        return full_reply
-    end = low.find("[/tool]", ti)
-    if end < 0:
+    if ti >= 0:
+        end = low.find("[/tool]", ti)
+        if end < 0:
+            return full_reply[:ti]
         return full_reply[:ti]
-    return full_reply[:ti]
+    # 仅有未写完的 [TOOL 开头（尚无 ]），整段不展示从该处起的缓冲
+    partial = re.search(r"\[tool(?!])", low)
+    if partial:
+        return full_reply[: partial.start()]
+    return full_reply
 
 
 def _strip_assistant_fabrication_after_tool(full_reply: str) -> str:
@@ -173,6 +220,18 @@ _EXPERT_LOG_REPLY_HEAD = 600
 # 流式对话：工具执行前提示；写入预览前提示（并记入 ai_chat）
 _SSE_TOOL_PLEASE_WAIT = "\n\n请稍等......\n\n"
 _WRITE_PREVIEW_CONFIRM_HINT = "「确认的内容」请确认。"
+
+
+def _write_preview_user_visible_log(result: Dict[str, Any]) -> str:
+    """与前端写入预览卡片一致的可读摘要，写入 business.ai_chat 助手行，便于用户与清洗任务可见。"""
+    lines = [_WRITE_PREVIEW_CONFIRM_HINT]
+    summary = (result.get("summary") or "").strip()
+    if summary:
+        lines.extend(["", "操作确认", summary])
+    exp = (result.get("expert_explanation") or "").strip()
+    if exp:
+        lines.extend(["", "操作说明", exp])
+    return "\n".join(lines).strip()
 
 
 def _trunc_for_log(s: Optional[str], max_len: int = _EXPERT_LOG_SQL_MAX) -> str:
@@ -215,6 +274,27 @@ def _format_tool_result(tool_block: Dict[str, str], result: Dict[str, Any]) -> s
     result_text = "\n".join(lines)
     logger.info(f"orchestrator: 回注给助手的 TOOL_RESULT:\n{result_text}")
     return result_text
+
+
+def _expert_payload_is_done(payload: Dict[str, Any]) -> bool:
+    """与 tool_expert 约定：done: true 或 type: done 均表示结束本轮（含 success: false 的说明性结束）。"""
+    if str(payload.get("type") or "").strip().lower() == "done":
+        return True
+    if payload.get("done"):
+        return True
+    return False
+
+
+def _combine_expert_done_failure_message(payload: Dict[str, Any]) -> str:
+    """将 done 且失败时的 error / need_info 原样拼成一段，便于注入 [TOOL_RESULT] 与助手理解。"""
+    parts: List[str] = []
+    err = payload.get("error")
+    if err is not None and str(err).strip() != "":
+        parts.append(str(err).strip())
+    ni = payload.get("need_info")
+    if ni is not None and str(ni).strip() != "":
+        parts.append(str(ni).strip())
+    return "\n".join(parts) if parts else "执行未成功"
 
 
 def _is_write_preview_result(result: Dict[str, Any]) -> bool:
@@ -297,14 +377,16 @@ async def _run_tool_expert_dialog(
             _trunc_for_log(str(payload.get("explanation") or ""), 200),
         )
 
-        if payload.get("done"):
+        if _expert_payload_is_done(payload):
             if pending_writes:
                 if not payload.get("success", False):
-                    return {
-                        "success": False,
-                        "error": payload.get("error")
-                        or "存在未确认的写入预览，但 done 未标记成功",
-                    }
+                    msg = _combine_expert_done_failure_message(payload)
+                    if msg == "执行未成功":
+                        msg = (
+                            payload.get("error")
+                            or "存在未确认的写入预览，但 done 未标记成功"
+                        )
+                    return {"success": False, "error": msg}
                 expert_overall = str(payload.get("summary") or "").strip() or None
                 engine_lines = [
                     f"{i + 1}) {w.get('summary') or ''}"
@@ -342,20 +424,32 @@ async def _run_tool_expert_dialog(
                     _trunc_for_log(overall_engine, 400),
                 )
                 return batch_out
-            out = {
-                "success": bool(payload.get("success", False)),
-                "summary": str(payload.get("summary", "") or ""),
-                "error": payload.get("error"),
-                "need_info": payload.get("need_info"),
-                "candidates": payload.get("candidates"),
-            }
+            success_ok = bool(payload.get("success", False))
+            summary = str(payload.get("summary", "") or "")
+            if not success_ok:
+                combined_err = _combine_expert_done_failure_message(payload)
+                out = {
+                    "success": False,
+                    "summary": summary,
+                    "error": combined_err,
+                    "need_info": None,
+                    "candidates": payload.get("candidates"),
+                }
+            else:
+                out = {
+                    "success": True,
+                    "summary": summary,
+                    "error": payload.get("error"),
+                    "need_info": payload.get("need_info"),
+                    "candidates": payload.get("candidates"),
+                }
             logger.info(
                 "tool_expert_detail | done | n=%d | success=%s | summary=%r | error=%r | need_info=%r",
                 step + 1,
                 out.get("success"),
                 _trunc_for_log(str(out.get("summary") or ""), 500),
                 out.get("error"),
-                out.get("need_info"),
+                payload.get("need_info"),
             )
             logger.info(
                 f"orchestrator: engine 执行结果: success={out.get('success')}, keys={list(out.keys())}"
@@ -596,6 +690,8 @@ async def _call_tool_expert_recover_after_failed_confirm(
             "请根据错误信息修正 SQL，重新输出 write（可多条），并以 done+summary 结束；"
             "仅一条 write 时可直接形成新预览。"
             "若「原始助手意图」中要求合同行项目/数量/产品，必须一并写入 contract_items，不可只写 contracts 主表。"
+            "若 上次执行引擎返回 中 error_type 为 dependency_missing：请把 message 原样转告用户，"
+            "并引导用户先在关联主数据（如员工、部门）中建立对应记录后再操作，勿盲目重试同一 SQL。"
         ),
         "错误与校验信息": failure_reason,
         "此前待执行的 batch": failed_batch,
@@ -676,8 +772,23 @@ def _cors_allow_origins_and_credentials() -> tuple[list[str], bool]:
 
 @asynccontextmanager
 async def _app_lifespan(app: FastAPI):
-    yield
-    close_all_pools()
+    global _task_pg_pool
+    _task_pg_pool = await asyncpg.create_pool(
+        host=os.environ.get("PGHOST", "localhost"),
+        database=os.environ.get("PGDATABASE", "aierp"),
+        user=os.environ.get("PGUSER", "nicjiang"),
+        password=os.environ.get("PG_API_PASSWORD", ""),
+        port=int(os.environ.get("PGPORT", "5432")),
+        min_size=1,
+        max_size=10,
+    )
+    try:
+        yield
+    finally:
+        if _task_pg_pool is not None:
+            await _task_pg_pool.close()
+            _task_pg_pool = None
+        close_all_pools()
 
 
 app = FastAPI(title="AI·ERP Backend", lifespan=_app_lifespan)
@@ -1995,14 +2106,10 @@ async def _confirm_writes_with_verify_and_recovery(
         if confirm_result.get("success"):
             v = verify_confirmed_writes(current, confirm_result)
             if v.get("ok"):
-                msg = "已经按照您的要求完成任务。"
-                if recovery_rounds:
-                    msg += f"（经 {recovery_rounds} 轮专家自动修正）"
                 return {
                     "success": True,
                     "results": confirm_result.get("results"),
                     "count": confirm_result.get("count"),
-                    "verify_message": msg,
                     "verify_ok": True,
                     "recovery_rounds": recovery_rounds,
                 }
@@ -2067,7 +2174,7 @@ def _sse_line(obj: Dict[str, Any]) -> bytes:
 
 
 def _assistant_line_from_write_confirm_result(r: Dict[str, Any]) -> str:
-    """与 AiPanel 展示一致，用于写入 ai_chat。"""
+    """兼容旧逻辑：失败时的简短展示（主路径已改为 TOOL_RESULT + 主助手续写）。"""
     if r.get("success"):
         vm = str(r.get("verify_message") or "").strip()
         if vm:
@@ -2076,6 +2183,345 @@ def _assistant_line_from_write_confirm_result(r: Dict[str, Any]) -> str:
     if r.get("task_failed"):
         return f"❌ {r.get('error') or '任务失败'}"
     return f"❌ 执行失败：{r.get('error') or '未知错误'}"
+
+
+_CONFIRM_FOLLOWUP_USER_SUCCESS = (
+    "【系统】用户已在界面确认执行上述数据库写入。"
+    "请结合当前完整对话与上一条 [TOOL_RESULT]（status: confirmed），"
+    "判断用户原始需求是否仍需后续步骤；需要则继续说明或按需输出 [TOOL]，无需则直接回复用户，勿使用固定套话收尾。"
+)
+
+_CONFIRM_FOLLOWUP_USER_FAILURE = (
+    "【系统】用户已在界面确认执行，但数据库写入未成功（见上一条 [TOOL_RESULT]，status: error）。"
+    "请结合完整对话与错误信息判断下一步：例如唯一约束/重复键可能表示记录已存在，可先查已有主键再继续关联操作；"
+    "外键缺失则先补主数据。需要时输出 [TOOL] 继续推进，不要仅终止对话。"
+)
+
+
+def _format_failed_confirm_tool_result(
+    batch: List[Dict[str, Any]],
+    tool_context: Optional[Dict[str, Any]],
+    result: Dict[str, Any],
+) -> str:
+    """确认执行失败时与成功分支同风格的 [TOOL_RESULT]，供主助手决策是否改 SQL/查重试。"""
+    lines = [
+        "[TOOL_RESULT]",
+        "action: confirm_failed",
+        "status: error",
+    ]
+    if tool_context:
+        a = (tool_context.get("action") or "").strip()
+        i = (tool_context.get("intent") or "").strip()
+        if a or i:
+            lines.append(f"original_intent: action={a} intent={i}")
+    err = result.get("error") or "未知错误"
+    lines.append(f"error: {err}")
+    le = result.get("last_error")
+    if le is not None and str(le).strip() and str(le).strip() != str(err).strip():
+        lines.append(f"last_error: {le}")
+    if "task_failed" in result:
+        lines.append(f"task_failed: {bool(result.get('task_failed'))}")
+    rr = result.get("recovery_rounds")
+    if rr is not None:
+        lines.append(f"recovery_rounds: {rr}")
+    et = result.get("error_type")
+    if et:
+        lines.append(f"error_type: {et}")
+    msg = result.get("message")
+    if msg and str(msg).strip() and str(msg).strip() != str(err).strip():
+        lines.append(f"message: {msg}")
+    lines.append(f"batch_sql_count: {len(batch)}")
+    lines.append("[/TOOL_RESULT]")
+    return "\n".join(lines)
+
+
+def _load_ai_chat_session_rows_for_assistant(session_id: int, limit: int = 80) -> List[Dict[str, Any]]:
+    """按时间顺序取最近若干条会话（过久会话只保留尾部以控制 token）。"""
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT role, content
+                FROM (
+                    SELECT role, content, id
+                    FROM business.ai_chat
+                    WHERE session_id = %s
+                    ORDER BY id DESC
+                    LIMIT %s
+                ) sub
+                ORDER BY id ASC
+                """,
+                (session_id, limit),
+            )
+            rows = cur.fetchall() or []
+    return [dict(r) for r in rows]
+
+
+def _ai_chat_rows_to_llm_messages(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """与编排器一致：tool 行作为 user 内容传入，便于主模型理解 [TOOL_RESULT]。"""
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        role = (r.get("role") or "").strip().lower()
+        content = r.get("content")
+        text = content if isinstance(content, str) else str(content or "")
+        if role == "system":
+            continue
+        if role == "tool":
+            out.append({"role": "user", "content": text})
+        elif role in ("user", "assistant"):
+            out.append({"role": role, "content": text})
+    return out
+
+
+def _format_confirmed_write_tool_result(
+    batch: List[Dict[str, Any]],
+    results: List[Dict[str, Any]],
+    tool_context: Optional[Dict[str, Any]] = None,
+) -> str:
+    """与 orchestrator 中 TOOL_RESULT 块风格一致，补充 status: confirmed 与执行明细。"""
+    lines = [
+        "[TOOL_RESULT]",
+        "action: confirmed_write",
+        "status: confirmed",
+    ]
+    if tool_context:
+        a = (tool_context.get("action") or "").strip()
+        i = (tool_context.get("intent") or "").strip()
+        if a or i:
+            lines.append(f"original_intent: action={a} intent={i}")
+    total_affected = 0
+    for r in results:
+        if not isinstance(r, dict):
+            r = {}
+        ar = r.get("affected_rows")
+        if isinstance(ar, int):
+            total_affected += ar
+    lines.append(f"affected_rows_total: {total_affected}")
+    lines.append(f"batch_count: {len(results)}")
+    lines.append("steps:")
+    for idx, (item, r) in enumerate(zip(batch, results), start=1):
+        if not isinstance(r, dict):
+            r = {}
+        op = r.get("operation") or ""
+        tbl = r.get("table") or ""
+        ar = r.get("affected_rows")
+        rid = r.get("id")
+        lines.append(
+            f"  {idx}) operation: {op} | table: {tbl} | affected_rows: {ar} | id: {rid}"
+        )
+        ret = r.get("returning")
+        if ret:
+            try:
+                tail = json.dumps(ret, ensure_ascii=False, default=str)
+                if len(tail) > 2000:
+                    tail = tail[:2000] + "…"
+                lines.append(f"     returning: {tail}")
+            except Exception:
+                pass
+    lines.append("[/TOOL_RESULT]")
+    return "\n".join(lines)
+
+
+def _format_confirmed_write_tool_result_minimal(
+    batch: List[Dict[str, Any]],
+    results: List[Dict[str, Any]],
+    exc_detail: str,
+) -> str:
+    """详细格式化异常时的兜底块，仍保证 status: confirmed 可被主助手消费。"""
+    return "\n".join(
+        [
+            "[TOOL_RESULT]",
+            "action: confirmed_write",
+            "status: confirmed",
+            "format_error: 详细步骤序列化失败，已降级",
+            f"detail: {exc_detail[:1500]}",
+            f"batch_sql_count: {len(batch)}",
+            f"results_len: {len(results)}",
+            "[/TOOL_RESULT]",
+        ]
+    )
+
+
+def _normalize_optional_session_id(raw: Any) -> Optional[int]:
+    """前端可能传字符串 session_id，统一为 int，非法则视为无会话。"""
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _returning_dict_from_confirm_results(res_list: Any) -> Dict[str, Any]:
+    """从 confirm 的 results 列表合并各步 returning 为单 dict；无则 {}。"""
+    out: Dict[str, Any] = {}
+    if not isinstance(res_list, list):
+        return out
+    for r in res_list:
+        if not isinstance(r, dict):
+            continue
+        ret = r.get("returning")
+        if isinstance(ret, dict):
+            out.update(ret)
+    return out
+
+
+async def _confirm_persist_tool_then_assistant(
+    *,
+    sid: Optional[int],
+    user_id: Optional[int],
+    tool_text: str,
+    followup: Optional[str],
+    result: Dict[str, Any],
+    empty_reply_fallback: str,
+    confirm_success: bool,
+    returning_data: Optional[Dict[str, Any]] = None,
+    failure_reason: Optional[str] = None,
+) -> None:
+    """
+    与失败分支一致：有 session 时先落库 role=tool，再主助手续写，再落库 assistant。
+    无 session 时不写库，仅内存续写。
+    """
+    task_context = ""
+    task: Optional[Dict[str, Any]] = None
+
+    if sid and _task_pg_pool:
+        if confirm_success:
+            # ── V9：任务状态机 ── confirm 成功 ──────────────────────────
+            task = await get_active_task(_task_pg_pool, sid)
+            if task:
+                step_idx = task["current_step"]
+                rd = returning_data if isinstance(returning_data, dict) else {}
+                await update_step_result(
+                    _task_pg_pool,
+                    task["id"],
+                    step_idx,
+                    "completed",
+                    rd,
+                )
+                if not is_last_step(task):
+                    await advance_step(_task_pg_pool, task["id"])
+                task = await get_active_task(_task_pg_pool, sid)
+                if task:
+                    task_context = "\n\n" + format_task_context(task)
+            # ── V9 结束 ──────────────────────────────────────────────────
+        else:
+            # ── V9：任务状态机 ── confirm 失败 ──────────────────────────
+            task = await get_active_task(_task_pg_pool, sid)
+            if task:
+                step_idx = task["current_step"]
+                fr = (failure_reason or "未知错误").strip()
+                await update_step_result(
+                    _task_pg_pool,
+                    task["id"],
+                    step_idx,
+                    "failed",
+                    {"error": fr},
+                )
+                task = await get_active_task(_task_pg_pool, sid)
+                if task:
+                    task_context = "\n\n" + format_task_context(task)
+            # ── V9 结束 ──────────────────────────────────────────────────
+
+    if sid is not None:
+        _insert_ai_chat_row(sid, "tool", tool_text)
+        logger.info(
+            "ai/confirm: ai_chat role=tool inserted session_id=%s content_len=%s",
+            sid,
+            len(tool_text or ""),
+        )
+        ar = await asyncio.to_thread(
+            _assistant_reply_after_confirm, sid, user_id, followup, task_context
+        )
+        if not (ar or "").strip():
+            ar = empty_reply_fallback
+        # ── V9：解析主助手回复，推进任务状态机 ────────────────────────
+        if task and sid and _task_pg_pool:
+            assistant_reply = ar
+            if "[PLAN]" in assistant_reply:
+                new_intent, new_steps = parse_plan(assistant_reply)
+                if new_intent and new_steps:
+                    if replan_limit_reached(task):
+                        await fail_task(
+                            _task_pg_pool,
+                            task["id"],
+                            "重规划次数已达上限，请手动处理。",
+                        )
+                    else:
+                        await replan_task(_task_pg_pool, task["id"], new_steps)
+                assistant_reply = re.sub(
+                    r"\[PLAN\].*?\[/PLAN\]", "", assistant_reply, flags=re.DOTALL
+                ).strip()
+                if "[PLAN]" in assistant_reply:
+                    _pi = assistant_reply.find("[PLAN]")
+                    assistant_reply = assistant_reply[:_pi].rstrip()
+            elif "[TOOL]" in assistant_reply:
+                pass
+            else:
+                if all_steps_completed(task):
+                    await complete_task(_task_pg_pool, task["id"], assistant_reply)
+                else:
+                    await fail_task(_task_pg_pool, task["id"], assistant_reply)
+            ar = assistant_reply
+        # ── V9 结束 ──────────────────────────────────────────────────
+        _insert_ai_chat_row(sid, "assistant", ar)
+        result["assistant_reply"] = ar
+        return
+    ar = await asyncio.to_thread(
+        _assistant_reply_after_confirm_no_session,
+        user_id,
+        tool_text,
+        followup,
+        task_context,
+    )
+    if not (ar or "").strip():
+        ar = empty_reply_fallback
+    result["assistant_reply"] = ar
+
+
+def _assistant_reply_after_confirm(
+    session_id: int,
+    user_id: Optional[int],
+    followup_user: Optional[str] = None,
+    task_context: str = "",
+) -> str:
+    system_prompt = build_prompt("assistant", user_id=user_id)
+    rows = _load_ai_chat_session_rows_for_assistant(session_id)
+    history = _ai_chat_rows_to_llm_messages(rows)
+    fu = (
+        followup_user
+        if followup_user is not None
+        else _CONFIRM_FOLLOWUP_USER_SUCCESS
+    )
+    if task_context:
+        fu = fu + task_context
+    messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": system_prompt},
+        *history,
+        {"role": "user", "content": fu},
+    ]
+    return chat(messages)
+
+
+def _assistant_reply_after_confirm_no_session(
+    user_id: Optional[int],
+    tool_text: str,
+    followup_user: Optional[str] = None,
+    task_context: str = "",
+) -> str:
+    """无 session_id 时仅根据 TOOL_RESULT 续写（不落库前无法拼全量历史）。"""
+    system_prompt = build_prompt("assistant", user_id=user_id)
+    fu = (
+        followup_user
+        if followup_user is not None
+        else _CONFIRM_FOLLOWUP_USER_SUCCESS
+    )
+    messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": tool_text + task_context},
+        {"role": "user", "content": fu},
+    ]
+    return chat(messages)
 
 
 @app.post("/ai/chat/log-message")
@@ -2113,18 +2559,81 @@ async def ai_confirm(body: WriteConfirmRequest):
     batch = _validate_write_payload_to_batch(pl)
     tc = pl.get("tool_context")
     tool_context = tc if isinstance(tc, dict) else None
-    sid = body.session_id
+    sid = _normalize_optional_session_id(body.session_id)
     result = await _confirm_writes_with_verify_and_recovery(
         batch,
         tool_context,
         user_id=body.user_id,
         session_id=sid,
     )
-    if sid is not None:
+    if result.get("success"):
+        res_list = result.get("results") or []
         try:
-            _insert_ai_chat_row(sid, "assistant", _assistant_line_from_write_confirm_result(result))
+            tool_text = _format_confirmed_write_tool_result(
+                batch, res_list, tool_context
+            )
+        except Exception as fe:
+            logger.exception(
+                "ai/confirm: _format_confirmed_write_tool_result failed: %s", fe
+            )
+            tool_text = _format_confirmed_write_tool_result_minimal(
+                batch, res_list, str(fe)
+            )
+        try:
+            await _confirm_persist_tool_then_assistant(
+                sid=sid,
+                user_id=body.user_id,
+                tool_text=tool_text,
+                followup=None,
+                result=result,
+                empty_reply_fallback="写入已执行。",
+                confirm_success=True,
+                returning_data=_returning_dict_from_confirm_results(res_list),
+            )
         except Exception as e:
-            logger.warning("ai/confirm: 写入 ai_chat 收尾失败 session_id=%s err=%s", sid, e)
+            logger.exception("ai/confirm: TOOL_RESULT 落库或主助手续写失败: %s", e)
+            err_reply = f"写入已执行，但生成后续回复时出错：{e}"
+            result["assistant_reply"] = err_reply
+            if sid is not None:
+                try:
+                    _insert_ai_chat_row(sid, "assistant", err_reply)
+                except Exception as e2:
+                    logger.warning(
+                        "ai/confirm: 写入失败说明到 ai_chat 失败 session_id=%s err=%s",
+                        sid,
+                        e2,
+                    )
+    else:
+        tool_text = _format_failed_confirm_tool_result(
+            batch, tool_context, result
+        )
+        try:
+            await _confirm_persist_tool_then_assistant(
+                sid=sid,
+                user_id=body.user_id,
+                tool_text=tool_text,
+                followup=_CONFIRM_FOLLOWUP_USER_FAILURE,
+                result=result,
+                empty_reply_fallback=(result.get("error") or "写入未成功。").strip(),
+                confirm_success=False,
+                failure_reason=(result.get("error") or "未知错误"),
+            )
+        except Exception as e:
+            logger.exception(
+                "ai/confirm: 失败分支 TOOL_RESULT 落库或主助手续写失败: %s", e
+            )
+            base = (result.get("error") or "执行失败").strip()
+            err_reply = f"{base}（生成后续回复时出错：{e}）"
+            result["assistant_reply"] = err_reply
+            if sid is not None:
+                try:
+                    _insert_ai_chat_row(sid, "assistant", err_reply)
+                except Exception as e2:
+                    logger.warning(
+                        "ai/confirm: 写入失败说明到 ai_chat 失败 session_id=%s err=%s",
+                        sid,
+                        e2,
+                    )
     return result
 
 
@@ -2297,12 +2806,12 @@ async def api_extract_core(body: Dict[str, Any] = Body(...)):
 @app.get("/ai/memory")
 def list_ai_memory(
     user_id: int = Query(..., description="员工用户 id"),
-    scope: str = Query(..., description="core 或 longterm"),
+    scope: str = Query(..., description="core、longterm 或 midterm"),
 ):
     """列出指定用户、指定 scope 的记忆行（不含 session）。"""
-    if scope not in ("core", "longterm"):
+    if scope not in ("core", "longterm", "midterm"):
         raise HTTPException(
-            status_code=400, detail="scope 须为 core 或 longterm"
+            status_code=400, detail="scope 须为 core、longterm 或 midterm"
         )
     with db_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -2537,6 +3046,31 @@ async def ai_chat(req: ChatRequest, request: Request):
                                     )
                                     last_vis_len = len(vis)
 
+                    # ── V9：检测 [PLAN] 块，写入任务状态机 ──────────────────────
+                    if "[PLAN]" in full_reply:
+                        plan_intent, plan_steps = parse_plan(full_reply)
+                        if (
+                            plan_intent
+                            and plan_steps
+                            and session_id
+                            and user_id is not None
+                            and _task_pg_pool is not None
+                        ):
+                            await create_task(
+                                pool=_task_pg_pool,
+                                session_id=session_id,
+                                user_id=user_id,
+                                original_intent=plan_intent,
+                                steps=plan_steps,
+                            )
+                        full_reply = re.sub(
+                            r"\[PLAN\].*?\[/PLAN\]", "", full_reply, flags=re.DOTALL
+                        ).strip()
+                        if "[PLAN]" in full_reply:
+                            _pi = full_reply.find("[PLAN]")
+                            full_reply = full_reply[:_pi].rstrip()
+                    # ── V9 结束 ──────────────────────────────────────────────────
+
                     logged_reply = _strip_assistant_fabrication_after_tool(full_reply)
                     assistant_user_visible = _user_visible_stream_prefix(full_reply).rstrip()
                     if user_id is not None and session_id is not None:
@@ -2588,6 +3122,8 @@ async def ai_chat(req: ChatRequest, request: Request):
                         result_text = _format_tool_result(tool_block, result)
                         if user_id is not None and session_id is not None:
                             _insert_ai_chat_row(session_id, "tool", result_text)
+                        _wp_log = _write_preview_user_visible_log(result)
+                        # delta 仍只下发简短提示，避免与前端卡片重复占屏；完整摘要写入 ai_chat，并由前端在 write_preview 事件中并入 content
                         yield _sse_line(
                             {
                                 "type": "delta",
@@ -2595,9 +3131,7 @@ async def ai_chat(req: ChatRequest, request: Request):
                             }
                         )
                         if user_id is not None and session_id is not None:
-                            _insert_ai_chat_row(
-                                session_id, "assistant", _WRITE_PREVIEW_CONFIRM_HINT
-                            )
+                            _insert_ai_chat_row(session_id, "assistant", _wp_log)
                         payload_wp = result.get("payload") or {
                             "sql": result.get("sql"),
                             "params": result.get("params") or [],
@@ -2695,6 +3229,31 @@ async def ai_chat(req: ChatRequest, request: Request):
             else:
                 full_reply = await asyncio.to_thread(chat, work_msgs)
 
+            # ── V9：检测 [PLAN] 块，写入任务状态机 ──────────────────────
+            if "[PLAN]" in full_reply:
+                plan_intent, plan_steps = parse_plan(full_reply)
+                if (
+                    plan_intent
+                    and plan_steps
+                    and session_id
+                    and user_id is not None
+                    and _task_pg_pool is not None
+                ):
+                    await create_task(
+                        pool=_task_pg_pool,
+                        session_id=session_id,
+                        user_id=user_id,
+                        original_intent=plan_intent,
+                        steps=plan_steps,
+                    )
+                full_reply = re.sub(
+                    r"\[PLAN\].*?\[/PLAN\]", "", full_reply, flags=re.DOTALL
+                ).strip()
+                if "[PLAN]" in full_reply:
+                    _pi = full_reply.find("[PLAN]")
+                    full_reply = full_reply[:_pi].rstrip()
+            # ── V9 结束 ──────────────────────────────────────────────────
+
             logged_reply = _strip_assistant_fabrication_after_tool(full_reply)
             assistant_user_visible = _user_visible_stream_prefix(full_reply).rstrip()
             if user_id is not None and session_id is not None:
@@ -2738,14 +3297,11 @@ async def ai_chat(req: ChatRequest, request: Request):
 
             if _is_write_preview_result(result):
                 result_text = _format_tool_result(tool_block, result)
+                _wp_log = _write_preview_user_visible_log(result)
                 if user_id is not None and session_id is not None:
                     _insert_ai_chat_row(session_id, "tool", result_text)
-                    _insert_ai_chat_row(session_id, "assistant", _WRITE_PREVIEW_CONFIRM_HINT)
-                reply = (
-                    assistant_user_visible
-                    + _SSE_TOOL_PLEASE_WAIT
-                    + _WRITE_PREVIEW_CONFIRM_HINT
-                )
+                    _insert_ai_chat_row(session_id, "assistant", _wp_log)
+                reply = assistant_user_visible + _SSE_TOOL_PLEASE_WAIT + _wp_log
                 pr = result
                 pr_tool_block = tool_block
                 break
