@@ -41,6 +41,9 @@ psql -U nicjiang -d aierp -f constitution/update_memory_session_clean_coref_time
   .venv/bin/python scripts/sync_meta_cn.py
 
 
+云端执行：cd /home/AIERP
+venv/bin/python scripts/sync_meta_cn.py
+
 一键启动前端+后端（在项目根目录执行）：
 ./dev.sh
 
@@ -93,3 +96,6 @@ kill <PID>
 若仍杀不掉，可用 kill -9 <PID>。
 
 提示：用 Ctrl+C 结束 dev.sh 时，有时会留下子进程；退出终端前尽量先停掉 dev，或按上面步骤清掉占用 8000 的进程。
+
+
+登陆数据库 ssh root@47.86.34.90
