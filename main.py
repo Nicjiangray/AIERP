@@ -271,21 +271,18 @@ def _format_tool_result(tool_block: Dict[str, str], result: Dict[str, Any]) -> s
     return result_text
 
 
-def _tool_block_indicates_write(tool_block: Dict[str, str]) -> bool:
-    """主助手 [TOOL] 块中的 action 是否表示写入类操作。"""
-    a = (tool_block.get("action") or "").strip().lower()
-    if not a:
-        return False
-    if a == "write" or "写" in a:
-        return True
-    return False
-
-
 def _append_progress_line_to_tool_result(text: str, progress: str) -> str:
     progress = (progress or "").strip()
     if not progress or "[/TOOL_RESULT]" not in text:
         return text
     return text.replace("[/TOOL_RESULT]", f"{progress}\n[/TOOL_RESULT]", 1)
+
+
+def _expert_result_is_done_success(result: Dict[str, Any]) -> bool:
+    """工具专家以 type=done 结束且 success=True（与 _run_tool_expert_dialog 返回字段一致）。"""
+    if not result.get("success"):
+        return False
+    return str(result.get("type") or "").strip().lower() == "done"
 
 
 async def _format_tool_result_with_task_progress(
@@ -295,14 +292,10 @@ async def _format_tool_result_with_task_progress(
     user_id: Optional[int],
 ) -> str:
     """
-    在工具专家返回的 TOOL_RESULT 基础上，对「写操作且已确认」补充任务进度行（见 get_task_progress_text）。
+    在工具专家返回的 TOOL_RESULT 基础上，当专家以 done+success 结束时补充任务进度行（见 get_task_progress_text）。
     """
     base = _format_tool_result(tool_block, result)
-    if not result.get("success"):
-        return base
-    if result.get("stage") != "confirmed":
-        return base
-    if not _tool_block_indicates_write(tool_block):
+    if not _expert_result_is_done_success(result):
         return base
     if session_id is None or user_id is None or _task_pg_pool is None:
         return base
@@ -474,6 +467,7 @@ async def _run_tool_expert_dialog(
             else:
                 out = {
                     "success": True,
+                    "type": "done",
                     "summary": summary,
                     "error": payload.get("error"),
                     "need_info": payload.get("need_info"),
@@ -2416,8 +2410,8 @@ async def _confirm_persist_task_and_tool_row(
     failure_reason: Optional[str] = None,
 ) -> None:
     """
-    更新 ai_tasks，并将 TOOL_RESULT（成功时可能含任务进度）写入 ai_chat(role=tool)。
-    不调用主助手；多步任务后续由 /ai/chat orchestrator 继续输出 [TOOL]。
+    更新 ai_tasks，并将 TOOL_RESULT 写入 ai_chat(role=tool)。
+    不调用主助手；任务进度由 orchestrator 在专家 done+success 时拼入 [TOOL_RESULT]。
     """
     if sid and _task_pg_pool:
         if confirm_success:
@@ -2450,17 +2444,11 @@ async def _confirm_persist_task_and_tool_row(
     if sid is None:
         return
 
-    text_out = tool_text
-    if confirm_success and user_id is not None and _task_pg_pool is not None:
-        progress = await get_task_progress_text(_task_pg_pool, sid, user_id)
-        if progress:
-            text_out = _append_progress_line_to_tool_result(tool_text, progress)
-
-    _insert_ai_chat_row(sid, "tool", text_out)
+    _insert_ai_chat_row(sid, "tool", tool_text)
     logger.info(
         "ai/confirm: ai_chat role=tool inserted session_id=%s content_len=%s",
         sid,
-        len(text_out or ""),
+        len(tool_text or ""),
     )
 
 
