@@ -56,16 +56,11 @@ from llm.client import (
 )
 from engine.task_manager import (
     advance_step,
-    all_steps_completed,
-    complete_task,
     create_task,
-    fail_task,
-    format_task_context,
     get_active_task,
+    get_task_progress_text,
     is_last_step,
     parse_plan,
-    replan_limit_reached,
-    replan_task,
     update_step_result,
 )
 
@@ -274,6 +269,47 @@ def _format_tool_result(tool_block: Dict[str, str], result: Dict[str, Any]) -> s
     result_text = "\n".join(lines)
     logger.info(f"orchestrator: 回注给助手的 TOOL_RESULT:\n{result_text}")
     return result_text
+
+
+def _tool_block_indicates_write(tool_block: Dict[str, str]) -> bool:
+    """主助手 [TOOL] 块中的 action 是否表示写入类操作。"""
+    a = (tool_block.get("action") or "").strip().lower()
+    if not a:
+        return False
+    if a == "write" or "写" in a:
+        return True
+    return False
+
+
+def _append_progress_line_to_tool_result(text: str, progress: str) -> str:
+    progress = (progress or "").strip()
+    if not progress or "[/TOOL_RESULT]" not in text:
+        return text
+    return text.replace("[/TOOL_RESULT]", f"{progress}\n[/TOOL_RESULT]", 1)
+
+
+async def _format_tool_result_with_task_progress(
+    tool_block: Dict[str, str],
+    result: Dict[str, Any],
+    session_id: Optional[int],
+    user_id: Optional[int],
+) -> str:
+    """
+    在工具专家返回的 TOOL_RESULT 基础上，对「写操作且已确认」补充任务进度行（见 get_task_progress_text）。
+    """
+    base = _format_tool_result(tool_block, result)
+    if not result.get("success"):
+        return base
+    if result.get("stage") != "confirmed":
+        return base
+    if not _tool_block_indicates_write(tool_block):
+        return base
+    if session_id is None or user_id is None or _task_pg_pool is None:
+        return base
+    progress = await get_task_progress_text(_task_pg_pool, session_id, user_id)
+    if not progress:
+        return base
+    return _append_progress_line_to_tool_result(base, progress)
 
 
 def _expert_payload_is_done(payload: Dict[str, Any]) -> bool:
@@ -2185,19 +2221,6 @@ def _assistant_line_from_write_confirm_result(r: Dict[str, Any]) -> str:
     return f"❌ 执行失败：{r.get('error') or '未知错误'}"
 
 
-_CONFIRM_FOLLOWUP_USER_SUCCESS = (
-    "【系统】用户已在界面确认执行上述数据库写入。"
-    "请结合当前完整对话与上一条 [TOOL_RESULT]（status: confirmed），"
-    "判断用户原始需求是否仍需后续步骤；需要则继续说明或按需输出 [TOOL]，无需则直接回复用户，勿使用固定套话收尾。"
-)
-
-_CONFIRM_FOLLOWUP_USER_FAILURE = (
-    "【系统】用户已在界面确认执行，但数据库写入未成功（见上一条 [TOOL_RESULT]，status: error）。"
-    "请结合完整对话与错误信息判断下一步：例如唯一约束/重复键可能表示记录已存在，可先查已有主键再继续关联操作；"
-    "外键缺失则先补主数据。需要时输出 [TOOL] 继续推进，不要仅终止对话。"
-)
-
-
 def _format_failed_confirm_tool_result(
     batch: List[Dict[str, Any]],
     tool_context: Optional[Dict[str, Any]],
@@ -2383,28 +2406,21 @@ def _returning_dict_from_confirm_results(res_list: Any) -> Dict[str, Any]:
     return _json_safe_confirm_value(out)
 
 
-async def _confirm_persist_tool_then_assistant(
+async def _confirm_persist_task_and_tool_row(
     *,
     sid: Optional[int],
     user_id: Optional[int],
     tool_text: str,
-    followup: Optional[str],
-    result: Dict[str, Any],
-    empty_reply_fallback: str,
     confirm_success: bool,
     returning_data: Optional[Dict[str, Any]] = None,
     failure_reason: Optional[str] = None,
 ) -> None:
     """
-    与失败分支一致：有 session 时先落库 role=tool，再主助手续写，再落库 assistant。
-    无 session 时不写库，仅内存续写。
+    更新 ai_tasks，并将 TOOL_RESULT（成功时可能含任务进度）写入 ai_chat(role=tool)。
+    不调用主助手；多步任务后续由 /ai/chat orchestrator 继续输出 [TOOL]。
     """
-    task_context = ""
-    task: Optional[Dict[str, Any]] = None
-
     if sid and _task_pg_pool:
         if confirm_success:
-            # ── V9：任务状态机 ── confirm 成功 ──────────────────────────
             task = await get_active_task(_task_pg_pool, sid)
             if task:
                 step_idx = task["current_step"]
@@ -2418,12 +2434,7 @@ async def _confirm_persist_tool_then_assistant(
                 )
                 if not is_last_step(task):
                     await advance_step(_task_pg_pool, task["id"])
-                task = await get_active_task(_task_pg_pool, sid)
-                if task:
-                    task_context = "\n\n" + format_task_context(task)
-            # ── V9 结束 ──────────────────────────────────────────────────
         else:
-            # ── V9：任务状态机 ── confirm 失败 ──────────────────────────
             task = await get_active_task(_task_pg_pool, sid)
             if task:
                 step_idx = task["current_step"]
@@ -2435,110 +2446,22 @@ async def _confirm_persist_tool_then_assistant(
                     "failed",
                     {"error": fr},
                 )
-                task = await get_active_task(_task_pg_pool, sid)
-                if task:
-                    task_context = "\n\n" + format_task_context(task)
-            # ── V9 结束 ──────────────────────────────────────────────────
 
-    if sid is not None:
-        _insert_ai_chat_row(sid, "tool", tool_text)
-        logger.info(
-            "ai/confirm: ai_chat role=tool inserted session_id=%s content_len=%s",
-            sid,
-            len(tool_text or ""),
-        )
-        ar = await asyncio.to_thread(
-            _assistant_reply_after_confirm, sid, user_id, followup, task_context
-        )
-        if not (ar or "").strip():
-            ar = empty_reply_fallback
-        # ── V9：解析主助手回复，推进任务状态机 ────────────────────────
-        if task and sid and _task_pg_pool:
-            assistant_reply = ar
-            if "[PLAN]" in assistant_reply:
-                new_intent, new_steps = parse_plan(assistant_reply)
-                if new_intent and new_steps:
-                    if replan_limit_reached(task):
-                        await fail_task(
-                            _task_pg_pool,
-                            task["id"],
-                            "重规划次数已达上限，请手动处理。",
-                        )
-                    else:
-                        await replan_task(_task_pg_pool, task["id"], new_steps)
-                assistant_reply = re.sub(
-                    r"\[PLAN\].*?\[/PLAN\]", "", assistant_reply, flags=re.DOTALL
-                ).strip()
-                if "[PLAN]" in assistant_reply:
-                    _pi = assistant_reply.find("[PLAN]")
-                    assistant_reply = assistant_reply[:_pi].rstrip()
-            elif "[TOOL]" in assistant_reply:
-                pass
-            else:
-                if all_steps_completed(task):
-                    await complete_task(_task_pg_pool, task["id"], assistant_reply)
-                else:
-                    await fail_task(_task_pg_pool, task["id"], assistant_reply)
-            ar = assistant_reply
-        # ── V9 结束 ──────────────────────────────────────────────────
-        _insert_ai_chat_row(sid, "assistant", ar)
-        result["assistant_reply"] = ar
+    if sid is None:
         return
-    ar = await asyncio.to_thread(
-        _assistant_reply_after_confirm_no_session,
-        user_id,
-        tool_text,
-        followup,
-        task_context,
+
+    text_out = tool_text
+    if confirm_success and user_id is not None and _task_pg_pool is not None:
+        progress = await get_task_progress_text(_task_pg_pool, sid, user_id)
+        if progress:
+            text_out = _append_progress_line_to_tool_result(tool_text, progress)
+
+    _insert_ai_chat_row(sid, "tool", text_out)
+    logger.info(
+        "ai/confirm: ai_chat role=tool inserted session_id=%s content_len=%s",
+        sid,
+        len(text_out or ""),
     )
-    if not (ar or "").strip():
-        ar = empty_reply_fallback
-    result["assistant_reply"] = ar
-
-
-def _assistant_reply_after_confirm(
-    session_id: int,
-    user_id: Optional[int],
-    followup_user: Optional[str] = None,
-    task_context: str = "",
-) -> str:
-    system_prompt = build_prompt("assistant", user_id=user_id)
-    rows = _load_ai_chat_session_rows_for_assistant(session_id)
-    history = _ai_chat_rows_to_llm_messages(rows)
-    fu = (
-        followup_user
-        if followup_user is not None
-        else _CONFIRM_FOLLOWUP_USER_SUCCESS
-    )
-    if task_context:
-        fu = fu + task_context
-    messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": system_prompt},
-        *history,
-        {"role": "user", "content": fu},
-    ]
-    return chat(messages)
-
-
-def _assistant_reply_after_confirm_no_session(
-    user_id: Optional[int],
-    tool_text: str,
-    followup_user: Optional[str] = None,
-    task_context: str = "",
-) -> str:
-    """无 session_id 时仅根据 TOOL_RESULT 续写（不落库前无法拼全量历史）。"""
-    system_prompt = build_prompt("assistant", user_id=user_id)
-    fu = (
-        followup_user
-        if followup_user is not None
-        else _CONFIRM_FOLLOWUP_USER_SUCCESS
-    )
-    messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": tool_text + task_context},
-        {"role": "user", "content": fu},
-    ]
-    return chat(messages)
 
 
 @app.post("/ai/chat/log-message")
@@ -2597,19 +2520,16 @@ async def ai_confirm(body: WriteConfirmRequest):
                 batch, res_list, str(fe)
             )
         try:
-            await _confirm_persist_tool_then_assistant(
+            await _confirm_persist_task_and_tool_row(
                 sid=sid,
                 user_id=body.user_id,
                 tool_text=tool_text,
-                followup=None,
-                result=result,
-                empty_reply_fallback="写入已执行。",
                 confirm_success=True,
                 returning_data=_returning_dict_from_confirm_results(res_list),
             )
         except Exception as e:
-            logger.exception("ai/confirm: TOOL_RESULT 落库或主助手续写失败: %s", e)
-            err_reply = f"写入已执行，但生成后续回复时出错：{e}"
+            logger.exception("ai/confirm: TOOL_RESULT 或任务状态落库失败: %s", e)
+            err_reply = f"写入已执行，但记录执行结果时出错：{e}"
             result["assistant_reply"] = err_reply
             if sid is not None:
                 try:
@@ -2625,22 +2545,19 @@ async def ai_confirm(body: WriteConfirmRequest):
             batch, tool_context, result
         )
         try:
-            await _confirm_persist_tool_then_assistant(
+            await _confirm_persist_task_and_tool_row(
                 sid=sid,
                 user_id=body.user_id,
                 tool_text=tool_text,
-                followup=_CONFIRM_FOLLOWUP_USER_FAILURE,
-                result=result,
-                empty_reply_fallback=(result.get("error") or "写入未成功。").strip(),
                 confirm_success=False,
                 failure_reason=(result.get("error") or "未知错误"),
             )
         except Exception as e:
             logger.exception(
-                "ai/confirm: 失败分支 TOOL_RESULT 落库或主助手续写失败: %s", e
+                "ai/confirm: 失败分支 TOOL_RESULT 或任务状态落库失败: %s", e
             )
             base = (result.get("error") or "执行失败").strip()
-            err_reply = f"{base}（生成后续回复时出错：{e}）"
+            err_reply = f"{base}（记录失败信息时出错：{e}）"
             result["assistant_reply"] = err_reply
             if sid is not None:
                 try:
@@ -3171,7 +3088,9 @@ async def ai_chat(req: ChatRequest, request: Request):
                         )
                         break
 
-                    result_text = _format_tool_result(tool_block, result)
+                    result_text = await _format_tool_result_with_task_progress(
+                        tool_block, result, session_id, user_id
+                    )
                     if user_id is not None and session_id is not None:
                         _insert_ai_chat_row(session_id, "tool", result_text)
 
@@ -3323,7 +3242,9 @@ async def ai_chat(req: ChatRequest, request: Request):
                 pr_tool_block = tool_block
                 break
 
-            result_text = _format_tool_result(tool_block, result)
+            result_text = await _format_tool_result_with_task_progress(
+                tool_block, result, session_id, user_id
+            )
             if user_id is not None and session_id is not None:
                 _insert_ai_chat_row(session_id, "tool", result_text)
 

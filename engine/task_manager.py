@@ -4,7 +4,7 @@ task_manager.py — V9 任务状态机
 职责：读写 business.ai_tasks，供 orchestrator（main.py）调用。
 LLM 不直接访问此模块，只通过 format_task_context() 生成的文本感知任务状态。
 
-所有函数均为同步函数，接收 asyncpg 连接池 pool 或 conn 作为参数，
+异步函数接收 asyncpg 连接池 pool；其余多为同步风格，
 与项目现有 db 访问风格保持一致。
 """
 
@@ -15,6 +15,46 @@ from datetime import datetime, timezone
 # ─────────────────────────────────────────────
 # 查询
 # ─────────────────────────────────────────────
+
+async def get_task_progress_text(pool, session_id: int, user_id: int) -> str:
+    """
+    返回当前 session 下 status=running 任务的进度一行文案；无则 ""。
+    若 plan 中全部步骤均为 completed，则调用 complete_task 并返回「任务全部完成」。
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, plan
+            FROM business.ai_tasks
+            WHERE session_id = $1 AND user_id = $2 AND status = 'running'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            session_id,
+            user_id,
+        )
+    if row is None:
+        return ""
+    plan = row["plan"]
+    if isinstance(plan, str):
+        plan = json.loads(plan)
+    task_id = row["id"]
+    if not plan:
+        return ""
+    completed = sum(1 for s in plan if s.get("status") == "completed")
+    total = len(plan)
+    if completed == total:
+        await complete_task(pool, task_id, "任务全部完成")
+        return "任务全部完成"
+    next_intent = ""
+    for s in plan:
+        if s.get("status") == "pending":
+            next_intent = (s.get("intent") or "").strip()
+            break
+    if not next_intent:
+        next_intent = "（待定）"
+    return f"任务进度：第{completed}步已完成 / 共{total}步，下一步：[{next_intent}]"
+
 
 async def get_active_task(pool, session_id: int) -> dict | None:
     """
