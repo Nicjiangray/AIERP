@@ -14,13 +14,47 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, List
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Tuple
+from zoneinfo import ZoneInfo
 
 from engine.prompt_builder import build_prompt_on_demand
 from llm.client import chat, chat_expert_only
 from tools.database import db_conn
 
 logger = logging.getLogger(__name__)
+
+# 会话清洗里展示消息时间与「昨天」等换算用的时区（可用环境变量覆盖）
+_MEMORY_CLEAN_TZ = ZoneInfo(os.environ.get("MEMORY_CLEAN_TZ") or "Asia/Shanghai")
+
+
+def _ts_for_memory_prompt(dt: Any) -> str:
+    """将 DB 返回的时间转为本地 ISO 字符串，供 LLM 做时间归一化。"""
+    if dt is None:
+        return "?"
+    if not isinstance(dt, datetime):
+        return str(dt)
+    t = dt
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    return t.astimezone(_MEMORY_CLEAN_TZ).isoformat(timespec="seconds")
+
+
+def _build_session_clean_chat_block(rows: List[Tuple[Any, ...]]) -> Tuple[str, str]:
+    """
+    拼装带逐条时间戳的对话块，并生成会话锚点时间（最后一条消息的本地时间）。
+    返回 (session_ref_time, chat_history_text)。
+    """
+    lines: List[str] = []
+    last_ts = ""
+    for row in rows:
+        role, content, created_at = row[0], row[1], row[2]
+        ts = _ts_for_memory_prompt(created_at)
+        last_ts = ts
+        text = content if content is not None else ""
+        lines.append(f"[{ts}] [{role}] {text}")
+    ref = last_ts or _ts_for_memory_prompt(None)
+    return ref, "\n".join(lines)
 
 
 def _memory_chat(messages: List[Dict[str, Any]]) -> str:
@@ -87,17 +121,24 @@ def clean_session(session_id: int) -> Dict[str, Any]:
     if not rows:
         return {"success": False, "error": f"session {session_id} 无对话记录"}
 
-    chat_history = "\n".join(f"[{row[0]}] {row[1]}" for row in rows)
+    session_ref_time, chat_history = _build_session_clean_chat_block(rows)
 
     prompt_template = build_prompt_on_demand("memory_session_clean")
     if not prompt_template:
         return {"success": False, "error": "未找到 memory_session_clean 提示词"}
 
-    system_prompt = prompt_template.replace("{chat_history}", chat_history)
+    system_prompt = (
+        prompt_template.replace("{chat_history}", chat_history).replace(
+            "{session_ref_time}", session_ref_time
+        )
+    )
 
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": "请从以上对话中提取业务要点。"},
+        {
+            "role": "user",
+            "content": "请从以上对话中提取业务要点，并完成指代消解与时间归一化（规则见 system）。",
+        },
     ]
 
     try:
