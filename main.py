@@ -2312,7 +2312,9 @@ def _format_confirmed_write_tool_result(
         ret = r.get("returning")
         if ret:
             try:
-                tail = json.dumps(ret, ensure_ascii=False, default=str)
+                tail = json.dumps(
+                    _json_safe_confirm_value(ret), ensure_ascii=False, default=str
+                )
                 if len(tail) > 2000:
                     tail = tail[:2000] + "…"
                 lines.append(f"     returning: {tail}")
@@ -2352,6 +2354,21 @@ def _normalize_optional_session_id(raw: Any) -> Optional[int]:
         return None
 
 
+def _json_safe_confirm_value(obj: Any) -> Any:
+    """将 date/datetime/time 及嵌套结构转为可 JSON 序列化的值（日期时间为 isoformat 字符串）。"""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, date):
+        return obj.isoformat()
+    if isinstance(obj, time):
+        return obj.isoformat()
+    if isinstance(obj, dict):
+        return {k: _json_safe_confirm_value(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe_confirm_value(x) for x in obj]
+    return obj
+
+
 def _returning_dict_from_confirm_results(res_list: Any) -> Dict[str, Any]:
     """从 confirm 的 results 列表合并各步 returning 为单 dict；无则 {}。"""
     out: Dict[str, Any] = {}
@@ -2363,7 +2380,7 @@ def _returning_dict_from_confirm_results(res_list: Any) -> Dict[str, Any]:
         ret = r.get("returning")
         if isinstance(ret, dict):
             out.update(ret)
-    return out
+    return _json_safe_confirm_value(out)
 
 
 async def _confirm_persist_tool_then_assistant(
@@ -2634,7 +2651,7 @@ async def ai_confirm(body: WriteConfirmRequest):
                         sid,
                         e2,
                     )
-    return result
+    return _json_safe_confirm_value(result)
 
 
 @app.post("/ai/feedback")
