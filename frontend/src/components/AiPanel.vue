@@ -30,6 +30,7 @@
       <!-- 消息 -->
       <div
         v-for="(msg, i) in messages"
+        v-show="msg.role !== 'tool'"
         :key="i"
         class="message"
         :class="[
@@ -621,7 +622,7 @@ const chatSessionId = ref(null)
 const lastFrameId = ref(null)
 const lastErrorMessage = ref(null)
 
-/** 将仅发生在前端的收尾文案同步到服务端 ai_chat（确认结果由 /ai/confirm 写入） */
+/** 将仅发生在前端的收尾文案同步到服务端 ai_chat（写入预览确认结果经 /ai/chat 回灌落库） */
 async function logChatMessageToServer(content, role = 'assistant') {
   const sid = chatSessionId.value
   if (sid == null || !content) return
@@ -684,6 +685,11 @@ async function confirmWritePreview(idx) {
     }
     messages.value.push({ role: 'assistant', content: line })
     await scrollToBottom()
+    const tr =
+      typeof data.tool_result === 'string' ? data.tool_result.trim() : ''
+    if (tr) {
+      await sendMessage(tr, { fromConfirmToolResult: true })
+    }
   } catch (e) {
     const errLine = `⚠ 确认执行失败：${e?.message || e}`
     messages.value.push({
@@ -1080,16 +1086,21 @@ async function readSseStreamBody(res, handleStreamPayload) {
   }
 }
 
-async function sendMessage(text) {
+async function sendMessage(text, options = {}) {
+  const fromConfirmToolResult = options.fromConfirmToolResult === true
   inputText.value = ''
-  if (messages.value.length === 0) {
+  if (messages.value.length === 0 && !fromConfirmToolResult) {
     messages.value.push({
       role: 'assistant',
       content: localWelcomeText,
       isLocalWelcome: true,
     })
   }
-  messages.value.push({ role: 'user', content: text })
+  if (fromConfirmToolResult) {
+    messages.value.push({ role: 'tool', content: text })
+  } else {
+    messages.value.push({ role: 'user', content: text })
+  }
   await scrollToBottom()
 
   loading.value = true

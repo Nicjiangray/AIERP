@@ -99,3 +99,15 @@ kill <PID>
 
 
 登陆数据库 ssh root@47.86.34.90
+
+本地更新云端迁移脚本
+./deploy.sh
+或：bash deploy.sh
+脚本行为：
+
+ssh root@47.86.34.90 → 在 /home/AIERP 执行 git pull
+迁移：默认注释掉；需要时在脚本里取消注释，并把 v35_xxx.sql 改成你要跑的 constitution 文件
+systemctl restart aierp 重启服务
+每次 ssh 若未配置密钥，会按提示输入密码（可能多次，属正常现象）。
+
+以后若你在 ~/.ssh/config 里配好密钥，同一脚本可继续用，一般不再问密码。若你云端服务名不是 aierp，把脚本里的 systemctl restart aierp 改成实际 unit 名即可。

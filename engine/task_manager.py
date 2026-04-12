@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 
 async def get_task_progress_text(pool, session_id: int, user_id: int) -> str:
     """
-    返回当前 session 下 status=running 任务的进度一行文案；无则 ""。
+    返回当前 session 下 status=running 任务的进度文案（可含多行）；无则 ""。
     若 plan 中全部步骤均为 completed，则调用 complete_task 并返回「任务全部完成」。
     """
     async with pool.acquire() as conn:
@@ -53,7 +53,19 @@ async def get_task_progress_text(pool, session_id: int, user_id: int) -> str:
             break
     if not next_intent:
         next_intent = "（待定）"
-    return f"任务进度：第{completed}步已完成 / 共{total}步，下一步：[{next_intent}]"
+    # --- 已完成步骤的结果摘要 ---
+    result_lines = []
+    for s in plan:
+        if s.get("status") == "completed" and s.get("result"):
+            r = s["result"]
+            result_lines.append(
+                f"第{s.get('step', '?')}步结果：{json.dumps(r, ensure_ascii=False, default=str)}"
+            )
+
+    parts = [f"任务进度：第{completed}步已完成 / 共{total}步"]
+    parts.extend(result_lines)
+    parts.append(f"下一步：[{next_intent}]")
+    return "\n".join(parts)
 
 
 async def get_active_task(pool, session_id: int) -> dict | None:

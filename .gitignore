@@ -5,6 +5,8 @@ __pycache__/
 # 本地覆盖与密钥（勿提交）；允许提交 frontend/.env.development、.env.production
 .env.local
 .env.*.local
+# 云端 SSH/PG 等本地密钥（由 .env.cloud.example 复制填写）
+.env.cloud
 .cursor*.log
 .cursor*.txt
 node_modules/

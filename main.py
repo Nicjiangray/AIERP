@@ -2410,8 +2410,8 @@ async def _confirm_persist_task_and_tool_row(
     failure_reason: Optional[str] = None,
 ) -> None:
     """
-    更新 ai_tasks，并将 TOOL_RESULT 写入 ai_chat(role=tool)。
-    不调用主助手；任务进度由 orchestrator 在专家 done+success 时拼入 [TOOL_RESULT]。
+    更新 ai_tasks（步骤状态、advance_step 等）。
+    TOOL_RESULT 不再在此写入 ai_chat；由前端回灌 /ai/chat 经 orchestrator 统一落库。
     """
     if sid and _task_pg_pool:
         if confirm_success:
@@ -2440,16 +2440,6 @@ async def _confirm_persist_task_and_tool_row(
                     "failed",
                     {"error": fr},
                 )
-
-    if sid is None:
-        return
-
-    _insert_ai_chat_row(sid, "tool", tool_text)
-    logger.info(
-        "ai/confirm: ai_chat role=tool inserted session_id=%s content_len=%s",
-        sid,
-        len(tool_text or ""),
-    )
 
 
 @app.post("/ai/chat/log-message")
@@ -2516,7 +2506,7 @@ async def ai_confirm(body: WriteConfirmRequest):
                 returning_data=_returning_dict_from_confirm_results(res_list),
             )
         except Exception as e:
-            logger.exception("ai/confirm: TOOL_RESULT 或任务状态落库失败: %s", e)
+            logger.exception("ai/confirm: 任务状态落库失败: %s", e)
             err_reply = f"写入已执行，但记录执行结果时出错：{e}"
             result["assistant_reply"] = err_reply
             if sid is not None:
@@ -2541,9 +2531,7 @@ async def ai_confirm(body: WriteConfirmRequest):
                 failure_reason=(result.get("error") or "未知错误"),
             )
         except Exception as e:
-            logger.exception(
-                "ai/confirm: 失败分支 TOOL_RESULT 或任务状态落库失败: %s", e
-            )
+            logger.exception("ai/confirm: 失败分支任务状态落库失败: %s", e)
             base = (result.get("error") or "执行失败").strip()
             err_reply = f"{base}（记录失败信息时出错：{e}）"
             result["assistant_reply"] = err_reply
@@ -2556,6 +2544,12 @@ async def ai_confirm(body: WriteConfirmRequest):
                         sid,
                         e2,
                     )
+    result["tool_result"] = tool_text
+    has_active_task = False
+    if sid is not None and _task_pg_pool is not None:
+        at = await get_active_task(_task_pg_pool, sid)
+        has_active_task = at is not None
+    result["has_active_task"] = has_active_task
     return _json_safe_confirm_value(result)
 
 
@@ -2842,6 +2836,44 @@ def _last_user_message_text(messages: List[ChatMessage]) -> str:
     return ""
 
 
+def _trace_user_input_for_incident(messages: List[ChatMessage]) -> str:
+    """orchestrator / log_incident 的 user_input：含 confirm 回灌时最后一条为 tool。"""
+    if not messages:
+        return ""
+    last = messages[-1]
+    lr = (last.role or "").strip().lower()
+    if lr in ("user", "tool"):
+        return last.content or ""
+    return _last_user_message_text(messages)
+
+
+def _incoming_message_for_session_log(messages: List[ChatMessage]) -> tuple[str, str]:
+    """本轮首条写入 ai_chat：通常为 user；确认后前端回灌为 tool。"""
+    if not messages:
+        return ("user", "")
+    last = messages[-1]
+    r = (last.role or "").strip().lower()
+    c = last.content or ""
+    if r == "tool":
+        return ("tool", c)
+    if r == "user":
+        return ("user", c)
+    return ("user", _last_user_message_text(messages))
+
+
+def _history_messages_for_llm(messages: List[ChatMessage]) -> List[Dict[str, Any]]:
+    """Chat Completions 仅支持 user/assistant：tool 行映射为 user（与 ai_chat 读库一致）。"""
+    out: List[Dict[str, Any]] = []
+    for m in messages:
+        r = (m.role or "").strip().lower()
+        c = m.content if isinstance(m.content, str) else ""
+        if r == "tool":
+            out.append({"role": "user", "content": c})
+        else:
+            out.append({"role": m.role, "content": c})
+    return out
+
+
 @app.post("/ai/chat")
 async def ai_chat(req: ChatRequest, request: Request):
     if req.pending_token:
@@ -2873,7 +2905,7 @@ async def ai_chat(req: ChatRequest, request: Request):
                 session_id = int(row[0]) if row else None
             conn.commit()
 
-    history_messages = [{"role": m.role, "content": m.content} for m in req.messages]
+    history_messages = _history_messages_for_llm(req.messages)
     file_summaries: List[str] = []
 
     if req.files:
@@ -2913,7 +2945,8 @@ async def ai_chat(req: ChatRequest, request: Request):
     ] + history_messages
 
     use_expert = bool(req.invite_expert)
-    user_msg_for_log = _last_user_message_text(req.messages)
+    trace_input = _trace_user_input_for_incident(req.messages)
+    log_role, log_content = _incoming_message_for_session_log(req.messages)
 
     # ── SSE 流式（前端默认 stream=true）──────────────────────────────
     if req.stream:
@@ -2934,7 +2967,7 @@ async def ai_chat(req: ChatRequest, request: Request):
                 work_msgs: List[Dict[str, Any]] = list(api_messages)
 
                 if user_id is not None and session_id is not None:
-                    _insert_ai_chat_row(session_id, "user", user_msg_for_log)
+                    _insert_ai_chat_row(session_id, log_role, log_content)
 
                 recent_tool_blocks: List[tuple[str, str]] = []
 
@@ -3015,7 +3048,7 @@ async def ai_chat(req: ChatRequest, request: Request):
                                 error_message=_ORCH_MSG_DUP_TOOL,
                                 session_id=session_id,
                                 user_id=user_id,
-                                user_input=user_msg_for_log,
+                                user_input=trace_input,
                                 context={
                                     "spin": True,
                                     "action": current_ai[0],
@@ -3091,7 +3124,7 @@ async def ai_chat(req: ChatRequest, request: Request):
                         error_message=_ORCH_MSG_MAX_ROUNDS,
                         session_id=session_id,
                         user_id=user_id,
-                        user_input=user_msg_for_log,
+                        user_input=trace_input,
                         context={"max_orchestrator_rounds": MAX_ORCHESTRATOR_ROUNDS},
                     )
                     yield _sse_line(
@@ -3134,7 +3167,7 @@ async def ai_chat(req: ChatRequest, request: Request):
 
     try:
         if user_id is not None and session_id is not None:
-            _insert_ai_chat_row(session_id, "user", user_msg_for_log)
+            _insert_ai_chat_row(session_id, log_role, log_content)
 
         recent_tool_blocks_ns: List[tuple[str, str]] = []
 
@@ -3201,7 +3234,7 @@ async def ai_chat(req: ChatRequest, request: Request):
                         error_message=_ORCH_MSG_DUP_TOOL,
                         session_id=session_id,
                         user_id=user_id,
-                        user_input=user_msg_for_log,
+                        user_input=trace_input,
                         context={
                             "spin": True,
                             "action": cur_ai[0],
@@ -3244,7 +3277,7 @@ async def ai_chat(req: ChatRequest, request: Request):
                 error_message=_ORCH_MSG_MAX_ROUNDS,
                 session_id=session_id,
                 user_id=user_id,
-                user_input=user_msg_for_log,
+                user_input=trace_input,
                 context={"max_orchestrator_rounds": MAX_ORCHESTRATOR_ROUNDS},
             )
             sep = "\n\n" if reply else ""

@@ -9,6 +9,8 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import bcrypt
+
 logger = logging.getLogger(__name__)
 
 # 拥有全表权限的角色（与 meta.role_permissions 中 admin 种子一致；含历史 super_admin）
@@ -750,6 +752,125 @@ def _insert_columns_if_present(sql: str) -> Optional[List[str]]:
     return out if out else None
 
 
+_UA_TABLE = "business.user_accounts"
+_BCRYPT_PREFIX_RE = re.compile(r"^\$2[aby]\$\d{2}\$")
+
+
+def _looks_like_bcrypt_hash(value: Any) -> bool:
+    if value is None:
+        return False
+    s = str(value).strip()
+    return bool(_BCRYPT_PREFIX_RE.match(s))
+
+
+def _default_password_hash_bcrypt() -> str:
+    """新建账号默认口令的哈希；用户首次登录后应修改（业务侧改密后续再做）。"""
+    return bcrypt.hashpw(b"123456", bcrypt.gensalt()).decode()
+
+
+def _replace_first_values_inner(sql: str, new_inner: str) -> str:
+    m = re.search(r"\bVALUES\s*\(", sql, re.IGNORECASE)
+    if not m:
+        return sql
+    open_at = m.start() + len(m.group(0)) - 1
+    end = _balanced_paren_end(sql, open_at)
+    if end < 0:
+        return sql
+    return sql[: open_at + 1] + new_inner + sql[end:]
+
+
+def _normalize_ua_insert_password(sql: str, params: List[Any]) -> Tuple[str, List[Any]]:
+    cols = _insert_columns_if_present(sql)
+    if not cols:
+        return sql, params
+    ph_idx = None
+    for i, c in enumerate(cols):
+        if c.lower() == "password_hash":
+            ph_idx = i
+            break
+    if ph_idx is None:
+        return sql, params
+    inner = _first_values_tuple_inner(sql)
+    if inner is None:
+        return sql, params
+    vals = _split_top_level_commas(inner)
+    if ph_idx >= len(vals):
+        return sql, params
+    new_params = list(params)
+    tok = vals[ph_idx].strip()
+    if tok == "%s":
+        pi = 0
+        for i, t in enumerate(vals):
+            if t.strip() != "%s":
+                continue
+            if i == ph_idx:
+                if pi < len(new_params) and not _looks_like_bcrypt_hash(new_params[pi]):
+                    new_params[pi] = _default_password_hash_bcrypt()
+                break
+            pi += 1
+        return sql, new_params
+    if _is_null_token(tok):
+        return sql, params
+    m = re.match(r"^'(.*)'$", tok, re.DOTALL)
+    if not m:
+        return sql, params
+    inner_val = m.group(1).replace("''", "'")
+    if _looks_like_bcrypt_hash(inner_val):
+        return sql, params
+    nh = _default_password_hash_bcrypt()
+    new_vals = list(vals)
+    new_vals[ph_idx] = "'" + nh.replace("'", "''") + "'"
+    new_inner = ",".join(new_vals)
+    return _replace_first_values_inner(sql, new_inner), new_params
+
+
+def _normalize_ua_update_password(sql: str, params: List[Any]) -> Tuple[str, List[Any]]:
+    new_params = list(params)
+
+    def repl_quoted(m):
+        qval = m.group(2)
+        literal = qval.replace("''", "'")
+        if _looks_like_bcrypt_hash(literal):
+            return m.group(0)
+        nh = _default_password_hash_bcrypt()
+        return m.group(1) + "'" + nh.replace("'", "''") + "'"
+
+    new_sql = re.sub(
+        r"(?i)(\bpassword_hash\s*=\s*)'([^']*)'",
+        repl_quoted,
+        sql,
+        count=1,
+    )
+    m = re.search(r"(?i)\bpassword_hash\s*=\s*%s", new_sql)
+    if m:
+        pidx = new_sql[: m.end()].count("%s") - 1
+        if 0 <= pidx < len(new_params) and not _looks_like_bcrypt_hash(new_params[pidx]):
+            new_params[pidx] = _default_password_hash_bcrypt()
+    return new_sql, new_params
+
+
+def _normalize_user_accounts_password(sql: str, params: List[Any]) -> Tuple[str, List[Any]]:
+    """
+    对 business.user_accounts 的 INSERT/UPDATE：若 password_hash 非 bcrypt（$2a$/$2b$/$2y$），
+    替换为默认口令 123456 的哈希。
+    """
+    raw = (sql or "").strip()
+    if not raw:
+        return raw, list(params or [])
+    params = list(params or [])
+    one = _first_statement(raw)
+    bare = _strip_string_literals_for_scan(one)
+    targets = _collect_write_target_tables(bare)
+    if not any(t.lower() == _UA_TABLE for t in targets):
+        return raw, params
+    st = _get_statement_type(one)
+    if st == "INSERT":
+        return _normalize_ua_insert_password(raw, params)
+    if st == "UPDATE":
+        return _normalize_ua_update_password(raw, params)
+    return raw, params
+
+
 def _first_values_tuple_inner(sql: str) -> Optional[str]:
     """VALUES ( ... ) 中第一组值的内部字符串。"""
     m = re.search(r"\bVALUES\s*\(", sql, re.IGNORECASE)
@@ -937,6 +1058,7 @@ def preview_sql(
         if st not in ("INSERT", "UPDATE", "DELETE"):
             return {"success": False, "error": "preview_sql 仅支持 INSERT/UPDATE/DELETE"}
 
+        sql, params = _normalize_user_accounts_password(sql.strip(), params)
         summary = _generate_summary(sql, params, audit, c)
         sql_clean = sql.strip()
         hw = highlight_words_from_summary(summary)
@@ -985,6 +1107,8 @@ def _confirm_write_single(
         return {"success": False, "error": "confirm 不执行 SELECT"}
     if st not in ("INSERT", "UPDATE", "DELETE"):
         return {"success": False, "error": "仅支持 INSERT/UPDATE/DELETE"}
+
+    sql, params = _normalize_user_accounts_password(sql, params)
 
     cur = None
     try:
