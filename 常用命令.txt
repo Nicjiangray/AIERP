@@ -4,6 +4,23 @@
 
 
 ────────────────────────────────────────
+Git 提交并推送到 GitHub（在项目根目录 aierp 执行）
+────────────────────────────────────────
+查看变更：git status
+暂存：git add <文件或目录>
+提交：git commit -m "简短说明本次改动"
+推送：git push origin main
+
+一条龙示例（按实际改动的路径替换 git add）：
+git add constitution/add_meta_prompts_agent_role.sql constitution/update_memory_session_clean_coref_time.sql engine/memory_manager.py
+git commit -m "feat(memory): 会话清洗指代消解与时间归一化"
+git push origin main
+
+记忆清洗提示词迁移（已有库执行一次，更新 meta.prompts 里 memory_session_clean）：
+psql -U nicjiang -d aierp -f constitution/update_memory_session_clean_coref_time.sql
+
+
+────────────────────────────────────────
 同步宪法 + 本地 LLM 填 meta 字段中文名（一次执行）
 ────────────────────────────────────────
 1）CALL meta.sync_constitution()：清空并重建 meta_fields、同步 meta_tables（表目录与字段行；field_cn 先留空）
