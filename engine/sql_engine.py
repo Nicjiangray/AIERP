@@ -1039,16 +1039,19 @@ def preview_sql(
     params = list(params or [])
 
     def _run(c) -> Dict[str, Any]:
-        audit = _audit_sql(sql, c, user_id)
+        # 勿对 sql/params 在本函数内再赋值到同名变量，否则闭包参数会被视为局部变量导致 UnboundLocalError
+        sql_work = (sql or "").strip()
+        params_work = list(params)
+        audit = _audit_sql(sql_work, c, user_id)
         if not audit["passed"]:
             reason = audit["reason"]
-            logger.warning("preview_sql: 审计未通过: %s | sql=%r", reason, sql[:500])
+            logger.warning("preview_sql: 审计未通过: %s | sql=%r", reason, sql_work[:500])
             if not is_audit_permission_only(reason):
                 log_incident(
                     stage="audit",
                     error_message=reason,
                     user_id=user_id,
-                    generated_sql=sql,
+                    generated_sql=sql_work,
                     context={"fn": "preview_sql"},
                 )
             return {"success": False, "error": reason}
@@ -1058,17 +1061,19 @@ def preview_sql(
         if st not in ("INSERT", "UPDATE", "DELETE"):
             return {"success": False, "error": "preview_sql 仅支持 INSERT/UPDATE/DELETE"}
 
-        sql, params = _normalize_user_accounts_password(sql.strip(), params)
-        summary = _generate_summary(sql, params, audit, c)
-        sql_clean = sql.strip()
+        sql_work, params_work = _normalize_user_accounts_password(
+            sql_work, params_work
+        )
+        summary = _generate_summary(sql_work, params_work, audit, c)
+        sql_clean = sql_work.strip()
         hw = highlight_words_from_summary(summary)
         return {
             "success": True,
             "summary": summary,
             "highlight_words": hw,
             "sql": sql_clean,
-            "params": params,
-            "payload": {"sql": sql_clean, "params": params},
+            "params": params_work,
+            "payload": {"sql": sql_clean, "params": params_work},
             "operation": st.lower(),
             "table": audit.get("target_table") or "",
             "stage": "preview",

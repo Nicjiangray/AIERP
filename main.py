@@ -73,6 +73,13 @@ if not logger.handlers:
     logger.addHandler(_orch_h)
 logger.propagate = False
 
+# meta_fields：界面列标题中文。优先手工 menu_label_cn，其次 sync_meta_cn 写入的 field_cn，最后字段名。
+_FIELD_MENU_LABEL_CN_SQL = """COALESCE(
+  NULLIF(BTRIM(COALESCE(menu_label_cn, '')), ''),
+  NULLIF(BTRIM(COALESCE(field_cn, '')), ''),
+  field_name
+)"""
+
 # asyncpg 池：供 engine.task_manager（business.ai_tasks）使用，与 psycopg2 的 db_conn 并行
 _task_pg_pool: Optional[asyncpg.Pool] = None
 
@@ -293,6 +300,8 @@ async def _format_tool_result_with_task_progress(
 ) -> str:
     """
     在工具专家返回的 TOOL_RESULT 基础上，当专家以 done+success 结束时补充任务进度行（见 get_task_progress_text）。
+
+    当前编排器不再调用本函数；任务进度仅在 /ai/confirm 构造 tool_result 时注入（写入真正完成后）。
     """
     base = _format_tool_result(tool_block, result)
     if not _expert_result_is_done_success(result):
@@ -1325,10 +1334,10 @@ def get_table_column_labels(table_name: str):
             )
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
-                """
-                SELECT field_name, COALESCE(menu_label_cn, field_name) AS menu_label_cn,
+                f"""
+                SELECT field_name, {_FIELD_MENU_LABEL_CN_SQL} AS menu_label_cn,
                        COALESCE(menu_label_en, field_name) AS menu_label_en,
-                       data_type
+                       data_type, field_cn
                 FROM meta.meta_fields
                 WHERE table_name = %s
                 ORDER BY id
@@ -1470,8 +1479,8 @@ def export_table_xlsx(
             name_to_meta = {r["name"]: r for r in meta}
 
             cur.execute(
-                """
-                SELECT field_name, COALESCE(menu_label_cn, field_name) AS menu_label_cn
+                f"""
+                SELECT field_name, {_FIELD_MENU_LABEL_CN_SQL} AS menu_label_cn
                 FROM meta.meta_fields
                 WHERE table_name = %s
                 """,
@@ -2220,36 +2229,12 @@ def _format_failed_confirm_tool_result(
     tool_context: Optional[Dict[str, Any]],
     result: Dict[str, Any],
 ) -> str:
-    """确认执行失败时与成功分支同风格的 [TOOL_RESULT]，供主助手决策是否改 SQL/查重试。"""
-    lines = [
-        "[TOOL_RESULT]",
-        "action: confirm_failed",
-        "status: error",
-    ]
-    if tool_context:
-        a = (tool_context.get("action") or "").strip()
-        i = (tool_context.get("intent") or "").strip()
-        if a or i:
-            lines.append(f"original_intent: action={a} intent={i}")
+    """确认执行失败：与 orchestrator _format_tool_result 错误块同形（action + status: error）。"""
     err = result.get("error") or "未知错误"
-    lines.append(f"error: {err}")
     le = result.get("last_error")
     if le is not None and str(le).strip() and str(le).strip() != str(err).strip():
-        lines.append(f"last_error: {le}")
-    if "task_failed" in result:
-        lines.append(f"task_failed: {bool(result.get('task_failed'))}")
-    rr = result.get("recovery_rounds")
-    if rr is not None:
-        lines.append(f"recovery_rounds: {rr}")
-    et = result.get("error_type")
-    if et:
-        lines.append(f"error_type: {et}")
-    msg = result.get("message")
-    if msg and str(msg).strip() and str(msg).strip() != str(err).strip():
-        lines.append(f"message: {msg}")
-    lines.append(f"batch_sql_count: {len(batch)}")
-    lines.append("[/TOOL_RESULT]")
-    return "\n".join(lines)
+        err = f"{err}（{le}）"
+    return _format_confirm_tool_result_error(tool_context, str(err))
 
 
 def _load_ai_chat_session_rows_for_assistant(session_id: int, limit: int = 80) -> List[Dict[str, Any]]:
@@ -2290,75 +2275,25 @@ def _ai_chat_rows_to_llm_messages(rows: List[Dict[str, Any]]) -> List[Dict[str, 
     return out
 
 
-def _format_confirmed_write_tool_result(
-    batch: List[Dict[str, Any]],
-    results: List[Dict[str, Any]],
-    tool_context: Optional[Dict[str, Any]] = None,
-) -> str:
-    """与 orchestrator 中 TOOL_RESULT 块风格一致，补充 status: confirmed 与执行明细。"""
-    lines = [
-        "[TOOL_RESULT]",
-        "action: confirmed_write",
-        "status: confirmed",
-    ]
-    if tool_context:
-        a = (tool_context.get("action") or "").strip()
-        i = (tool_context.get("intent") or "").strip()
-        if a or i:
-            lines.append(f"original_intent: action={a} intent={i}")
-    total_affected = 0
-    for r in results:
-        if not isinstance(r, dict):
-            r = {}
-        ar = r.get("affected_rows")
-        if isinstance(ar, int):
-            total_affected += ar
-    lines.append(f"affected_rows_total: {total_affected}")
-    lines.append(f"batch_count: {len(results)}")
-    lines.append("steps:")
-    for idx, (item, r) in enumerate(zip(batch, results), start=1):
-        if not isinstance(r, dict):
-            r = {}
-        op = r.get("operation") or ""
-        tbl = r.get("table") or ""
-        ar = r.get("affected_rows")
-        rid = r.get("id")
-        lines.append(
-            f"  {idx}) operation: {op} | table: {tbl} | affected_rows: {ar} | id: {rid}"
-        )
-        ret = r.get("returning")
-        if ret:
-            try:
-                tail = json.dumps(
-                    _json_safe_confirm_value(ret), ensure_ascii=False, default=str
-                )
-                if len(tail) > 2000:
-                    tail = tail[:2000] + "…"
-                lines.append(f"     returning: {tail}")
-            except Exception:
-                pass
-    lines.append("[/TOOL_RESULT]")
-    return "\n".join(lines)
-
-
 def _format_confirmed_write_tool_result_minimal(
     batch: List[Dict[str, Any]],
     results: List[Dict[str, Any]],
     exc_detail: str,
 ) -> str:
-    """详细格式化异常时的兜底块，仍保证 status: confirmed 可被主助手消费。"""
-    return "\n".join(
-        [
-            "[TOOL_RESULT]",
-            "action: confirmed_write",
-            "status: confirmed",
-            "format_error: 详细步骤序列化失败，已降级",
-            f"detail: {exc_detail[:1500]}",
-            f"batch_sql_count: {len(batch)}",
-            f"results_len: {len(results)}",
-            "[/TOOL_RESULT]",
-        ]
-    )
+    """_format_confirm_tool_result_success 异常时的兜底，仍与 orchestrator 成功块同形。"""
+    rd = _returning_dict_from_confirm_results(results)
+    lines = [
+        "[TOOL_RESULT]",
+        "action: create",
+        "status: success",
+        f"summary: 写入已执行（摘要生成异常：{exc_detail[:400]}）",
+    ]
+    if rd:
+        lines.append(
+            "returning: " + json.dumps(rd, ensure_ascii=False, default=str)
+        )
+    lines.append("[/TOOL_RESULT]")
+    return "\n".join(lines)
 
 
 def _normalize_optional_session_id(raw: Any) -> Optional[int]:
@@ -2398,6 +2333,100 @@ def _returning_dict_from_confirm_results(res_list: Any) -> Dict[str, Any]:
         if isinstance(ret, dict):
             out.update(ret)
     return _json_safe_confirm_value(out)
+
+
+def _preview_summary_to_confirm_done_summary(preview_summary: str) -> str:
+    """将 preview_sql 阶段摘要改为完成时态（将在… → 已在…）。"""
+    s = (preview_summary or "").strip()
+    if not s:
+        return s
+    s = s.replace("将在【", "已在【", 1)
+    s = s.replace("将修改【", "已修改【", 1)
+    s = s.replace("将删除【", "已删除【", 1)
+    if s.startswith("将"):
+        s = "已" + s[1:]
+    return s
+
+
+def _confirm_action_for_tool_result(
+    tool_context: Optional[Dict[str, Any]],
+    res_list: List[Dict[str, Any]],
+) -> str:
+    """与 [TOOL] action 对齐：create / update / delete。"""
+    if tool_context:
+        a = (tool_context.get("action") or "").strip().lower()
+        if a in ("create", "update", "delete"):
+            return a
+    r0 = res_list[0] if res_list and isinstance(res_list[0], dict) else {}
+    op = (r0.get("operation") or "").strip().lower()
+    return {"insert": "create", "update": "update", "delete": "delete"}.get(
+        op, "create"
+    )
+
+
+def _confirm_success_fallback_summary(
+    res_list: List[Dict[str, Any]], batch: List[Dict[str, Any]]
+) -> str:
+    """无预览摘要时的兜底文案。"""
+    r0 = res_list[0] if res_list and isinstance(res_list[0], dict) else {}
+    tbl = (r0.get("table") or "").strip()
+    op = (r0.get("operation") or "").strip().lower()
+    if tbl:
+        if op == "insert":
+            return f"已在【{tbl}】中新建记录。"
+        if op == "update":
+            return f"已修改【{tbl}】中的记录。"
+        if op == "delete":
+            return f"已删除【{tbl}】中的记录。"
+    return "写入已执行。"
+
+
+def _format_confirm_tool_result_success(
+    preview_summary: str,
+    tool_context: Optional[Dict[str, Any]],
+    res_list: List[Dict[str, Any]],
+    batch: List[Dict[str, Any]],
+) -> str:
+    """
+    /ai/confirm 成功：与 orchestrator _format_tool_result 成功分支同形，另附 returning 行。
+    """
+    summary = _preview_summary_to_confirm_done_summary(preview_summary)
+    if not summary:
+        summary = _confirm_success_fallback_summary(res_list, batch)
+    action = _confirm_action_for_tool_result(tool_context, res_list)
+    returning_data = _returning_dict_from_confirm_results(res_list)
+    lines = [
+        "[TOOL_RESULT]",
+        f"action: {action}",
+        "status: success",
+        f"summary: {summary}",
+    ]
+    if returning_data:
+        lines.append(
+            "returning: "
+            + json.dumps(returning_data, ensure_ascii=False, default=str)
+        )
+    lines.append("[/TOOL_RESULT]")
+    return "\n".join(lines)
+
+
+def _format_confirm_tool_result_error(
+    tool_context: Optional[Dict[str, Any]], error_message: str
+) -> str:
+    """与 _format_tool_result 失败分支一致：action + status: error + error。"""
+    action = "create"
+    if tool_context:
+        a = (tool_context.get("action") or "").strip().lower()
+        if a in ("create", "update", "delete"):
+            action = a
+    lines = [
+        "[TOOL_RESULT]",
+        f"action: {action}",
+        "status: error",
+        f"error: {error_message}",
+        "[/TOOL_RESULT]",
+    ]
+    return "\n".join(lines)
 
 
 async def _confirm_persist_task_and_tool_row(
@@ -2486,13 +2515,14 @@ async def ai_confirm(body: WriteConfirmRequest):
     )
     if result.get("success"):
         res_list = result.get("results") or []
+        preview_summary = str(pl.get("summary") or "")
         try:
-            tool_text = _format_confirmed_write_tool_result(
-                batch, res_list, tool_context
+            tool_text = _format_confirm_tool_result_success(
+                preview_summary, tool_context, res_list, batch
             )
         except Exception as fe:
             logger.exception(
-                "ai/confirm: _format_confirmed_write_tool_result failed: %s", fe
+                "ai/confirm: _format_confirm_tool_result_success failed: %s", fe
             )
             tool_text = _format_confirmed_write_tool_result_minimal(
                 batch, res_list, str(fe)
@@ -2544,6 +2574,12 @@ async def ai_confirm(body: WriteConfirmRequest):
                         sid,
                         e2,
                     )
+    if sid is not None and _task_pg_pool is not None and body.user_id is not None:
+        progress = await get_task_progress_text(
+            _task_pg_pool, sid, int(body.user_id)
+        )
+        if progress:
+            tool_text = _append_progress_line_to_tool_result(tool_text, progress)
     result["tool_result"] = tool_text
     has_active_task = False
     if sid is not None and _task_pg_pool is not None:
@@ -3109,9 +3145,7 @@ async def ai_chat(req: ChatRequest, request: Request):
                         )
                         break
 
-                    result_text = await _format_tool_result_with_task_progress(
-                        tool_block, result, session_id, user_id
-                    )
+                    result_text = _format_tool_result(tool_block, result)
                     if user_id is not None and session_id is not None:
                         _insert_ai_chat_row(session_id, "tool", result_text)
 
@@ -3263,9 +3297,7 @@ async def ai_chat(req: ChatRequest, request: Request):
                 pr_tool_block = tool_block
                 break
 
-            result_text = await _format_tool_result_with_task_progress(
-                tool_block, result, session_id, user_id
-            )
+            result_text = _format_tool_result(tool_block, result)
             if user_id is not None and session_id is not None:
                 _insert_ai_chat_row(session_id, "tool", result_text)
 

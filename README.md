@@ -74,7 +74,7 @@
    - System：`build_prompt('tool_expert')`（**`schema_shadow` + `tool_expert_executor`** 等）。  
    - User：外层解析出的 **`[TOOL]` 块内容**（外加 orchestrator 注入的说明），**不是**把整段主助手对话交给 expert。  
    - Expert 在**独立多轮 JSON** 中执行：`type: query` → **`execute_sql`**，`type: write` → **`preview_sql`**，直至 `done` 或单条/多条写入预览就绪；最多 **`MAX_EXPERT_STEPS`（当前 30）** 步（适合多行合同、多 `write` 再 `done` 汇总）。  
-   - 返回给外层的是结构化结果；成功 **`done`** 时结果中含 **`type: "done"`** 与 **`success: true`**。先由 **`_format_tool_result`** 包成 **`[TOOL_RESULT]`**，再由 **`_format_tool_result_with_task_progress`** 在 **专家 `done`+`success`** 且存在 **`ai_tasks` 活跃任务** 时，把 **`get_task_progress_text`** 生成的一行进度插在 **`[/TOOL_RESULT]`** 之前，回注主助手。
+   - 返回给外层的是结构化结果；成功 **`done`** 时结果中含 **`type: "done"`** 与 **`success: true`**。由 **`_format_tool_result`** 包成 **`[TOOL_RESULT]`** 回注主助手（**不**在此处拼任务进度：专家 **`done`+`success`** 仅表示预览闭环，写入尚未发生）。多步任务进度只在用户 **`/ai/confirm`** 确认写入后，在响应字段 **`tool_result`** 里注入（见下文 **V9**）。
 
 3. **写入确认与重试**  
    - 预览成功 → 前端 **`/ai/confirm`** 执行 **`confirm_batch_sql`** 等；执行/意图校验失败时由 **`_call_tool_expert_recover_after_failed_confirm`** 再跑内层 expert，最多 **`MAX_WRITE_CONFIRM_ATTEMPTS`（当前 3）** 次，与 **`MAX_EXPERT_STEPS`**（内层 expert 步数）、**`MAX_ORCHESTRATOR_ROUNDS`**（外层轮数）无关。
@@ -214,7 +214,7 @@
 **Orchestrator / confirm 修复**
 
 - **`type: done` 识别修复**：tool_expert 返回 `{"type": "done", ...}` 时不再报「未知指令类型」；新增 `_expert_payload_is_done(payload)` 同时识别 `type=done` 与 `done=true` 两种写法。
-- **`/ai/confirm`（曾实现）**：曾将 `[TOOL_RESULT]` 落库后调用主助手续写并返回 `assistant_reply`。**当前行为以下文「V9：多步任务状态机」为准**：confirm 仅执行写入、更新 **`ai_tasks`**、落库 **`role=tool`**，**不**调用主助手；多步任务进度由 **`/ai/chat` orchestrator** 在工具专家 **`done`+`success`** 时拼入 **`[TOOL_RESULT]`**。
+- **`/ai/confirm`**：**当前行为**见下文「V9」——执行写入、更新 **`ai_tasks`**，响应 **`tool_result`**（统一形制的 **`[TOOL_RESULT]`**，并在该字符串上注入任务进度）；由前端再 **`POST /ai/chat`** 回灌，**不**在 confirm 内调用主助手。
 
 **write_engine 异常翻译**
 
@@ -250,7 +250,7 @@
 
 ### V9：多步任务状态机（`[PLAN]` + `ai_tasks`）（2026-04-12）
 
-将「依赖前置数据的多步操作」的规划与执行状态落在 **`business.ai_tasks`**，由 **`main.py` orchestrator** 与 **`/ai/confirm`** 更新任务行；主助手通过回注的 **`[TOOL_RESULT]`**（在工具专家 **`type: "done"` 且 `success: true`** 时，可额外插入一行 **`get_task_progress_text`** 进度文案）感知进度。**tool_expert 不直接见 `ai_tasks` 表**（`include_in_domain_model = false`）。
+将「依赖前置数据的多步操作」的规划与执行状态落在 **`business.ai_tasks`**，由 **`main.py` orchestrator** 与 **`/ai/confirm`** 更新任务行；主助手对任务进度的感知**仅**来自 **`/ai/confirm` 响应里的 `tool_result`**：在写入**真正完成**后，把 **`get_task_progress_text`** 生成的一行插在 **`[/TOOL_RESULT]`** 之前（与 **`_append_progress_line_to_tool_result`** 同形）。**Orchestrator 里专家 `done`+`success` 的 `[TOOL_RESULT]` 不拼进度**（彼时仅为预览闭环）。**tool_expert 不直接见 `ai_tasks` 表**（`include_in_domain_model = false`）。
 
 **表与迁移**
 
@@ -262,8 +262,8 @@
 
 - **`engine/task_manager.py`**：`get_active_task` / `create_task` / `update_step_result` / `advance_step` / `replan_task` / `complete_task` / `fail_task`；**`get_task_progress_text`**（会话下 **`status=running`** 任务：生成「任务进度：…」一行；若 **`plan`** 中步骤**全部**为 **`completed`** 则 **`complete_task`** 并返回「任务全部完成」）；`format_task_context`（生成 **`[TASK_STATUS]`** 文本，可供其它场景使用）；`parse_plan`。使用 **asyncpg** 连接池（与 **`psycopg2`** 的 **`db_conn()`** 并行）。
 - **`main.py`**：
-  - **`/ai/chat`**：主助手完整回复后若含 **`[PLAN]`**，则 **`parse_plan` → `create_task`**，并从下发与落库正文中去掉 **`[PLAN]...[/PLAN]`**（SSE 与 **`_user_visible_stream_prefix`** 一致过滤）。若含 **`[TOOL]`** → **`_call_tool_expert`**；专家闭环成功返回 **`type: "done"`** 时，**`_format_tool_result_with_task_progress`** 在 **`_format_tool_result`** 之后追加任务进度（见上）。**写入预览**（`stage: preview`）走原 **`_format_tool_result`**，不拼进度。
-  - **`/ai/confirm`**（**`_confirm_persist_task_and_tool_row`**）：执行 **`confirm_batch_sql`**（及校验/专家恢复逻辑）；按成功或失败 **`update_step_result`**，成功且非最后一步则 **`advance_step`**；将 **`[TOOL_RESULT]`** 写入 **`ai_chat(role=tool)`**。**不**调用主助手，**不在** confirm 响应路径内拼接任务进度（进度由后续 **`/ai/chat`** 在专家 **`done`+success** 时注入 **`[TOOL_RESULT]`**）。
+  - **`/ai/chat`**：主助手完整回复后若含 **`[PLAN]`**，则 **`parse_plan` → `create_task`**，并从下发与落库正文中去掉 **`[PLAN]...[/PLAN]`**（SSE 与 **`_user_visible_stream_prefix`** 一致过滤）。若含 **`[TOOL]`** → **`_call_tool_expert`**；专家闭环成功返回 **`type: "done"`** 时仅用 **`_format_tool_result`** 包成 **`[TOOL_RESULT]`**（**不**拼任务进度）。**写入预览**（`stage: preview`）同样走 **`_format_tool_result`**。保留函数 **`_format_tool_result_with_task_progress`**（当前编排器**不调用**）。
+  - **`/ai/confirm`**（**`_confirm_persist_task_and_tool_row`** 等）：执行 **`confirm_batch_sql`**（及校验/专家恢复逻辑）；按成功或失败 **`update_step_result`**，成功且非最后一步则 **`advance_step`**；构造响应 **`tool_result`**（与 orchestrator 同形的 **`[TOOL_RESULT]`**，成功/失败文案见 `main.py`），并在返回前用 **`get_task_progress_text` + `_append_progress_line_to_tool_result`** 注入任务进度；**不**调用主助手。前端将 **`tool_result`** 作为 **`role=tool`** 内容再发 **`/ai/chat`**，由 orchestrator 统一落库与续写。
   - 应用生命周期内维护 **`_task_pg_pool`**（asyncpg），供 **`task_manager`** 使用。
 - **依赖**：根目录 **`requirements.txt`** 含 **`asyncpg`**。
 
@@ -318,7 +318,7 @@ aierp/
 | `write_engine.py` | 旧版：结构化 payload 的预览与写入 | **deprecated**：同上 |
 | `prompt_builder.py` | 统一 prompt 拼装：按 `agent_role` 取 `meta.prompts` + 按 `user_id` 取 `ai_memory` | **已完成**：`assistant` / `tool_expert` / `memory_manager` |
 | `memory_manager.py` | 记忆管理员：`clean_session()`、`compress_longterm()`、`merge_midterm()`（中记忆合并） | **已完成**：手动 API 触发 |
-| **`task_manager.py`** | **V9**：`business.ai_tasks` 读写、**`get_task_progress_text`** / **`format_task_context`**、`parse_plan`；供 **`main.py`** orchestrator 使用（asyncpg）；**`/ai/confirm`** 仅调用 **`update_step_result`** 等 | **已完成** |
+| **`task_manager.py`** | **V9**：`business.ai_tasks` 读写、**`get_task_progress_text`** / **`format_task_context`**、`parse_plan`；**`get_task_progress_text`** 由 **`/ai/confirm`** 在构造 **`tool_result`** 时调用（asyncpg）；**`update_step_result`** 等亦由 confirm / 任务流调用 | **已完成** |
 | `incident_logger.py` | 系统错误记录：`log_incident()` | **已完成**：在 `sql_engine` / `main.py` 各 except 块调用 |
 
 ---
@@ -341,9 +341,9 @@ aierp/
 | `/table/{schema}/{table_name}/{row_id}` | DELETE | 硬删除一行 | 可用 |
 | **`/auth/login`** | **POST** | **body：`{ login_name, password }`**；bcrypt 校验 **`business.user_accounts`**；返回 **`user`**（`id`=`employees.id`） | 可用 |
 | **`/auth/me`** | **GET** | **Query：`user_id`**（员工 id）；返回 **`{ user: {...} }`**，不存在则 404 | 可用 |
-| `/ai/confirm` | POST | 执行经 **`preview_sql`** 审核的写 SQL：`payload` 含 **`batch`** 或单条 **`sql`/`params`**；可选 **`session_id`**：**V9** 下更新 **`ai_tasks`** 当前步并写入 **`ai_chat(role=tool)`** 的 **`[TOOL_RESULT]`**，**不**调用主助手；响应通常无 **`assistant_reply`**（前端可回落为「写入已执行。」）；任务进度见 **`/ai/chat`** 专家 **`done`+success** 时的 **`[TOOL_RESULT]`** | 可用 |
+| `/ai/confirm` | POST | 执行经 **`preview_sql`** 审核的写 SQL：`payload` 含 **`batch`** 或单条 **`sql`/`params`**（及预览 **`summary`** 等）；可选 **`session_id`**：**V9** 下更新 **`ai_tasks`**；返回 **`tool_result`**（**`[TOOL_RESULT]`** + 任务进度行）、**`has_active_task`** 等；**不**调用主助手；由前端将 **`tool_result`** 回灌 **`/ai/chat`** | 可用 |
 | `/ai/chat/log-message` | POST | 将一条 **`assistant` / `user` / `tool` / `system`** 消息追加写入 **`ai_chat`**（如取消写入、终止流、前端异常提示） | 可用 |
-| `/ai/chat` | POST | **双层 orchestrator**：`build_prompt('assistant', user_id)` + 主模型（默认 **`chat`/`chat_stream`**，可选 **`inviteExpert: true`** → **`chat_expert_only`**）；若回复含 **`[PLAN]`**（**V9**）则解析并 **`create_task`**、正文过滤 **`[PLAN]`**；若含 **`[TOOL]`** → **`_call_tool_expert`**（内层多步 **`execute_sql`/`preview_sql`**）；专家 **`done`+`success`** 时 **`[TOOL_RESULT]`** 可拼 **`get_task_progress_text`** 一行（**V9**）；**SSE** 默认；**`user_id`** 时建 **`ai_sessions`** 并写 **`ai_chat`** | 可用 |
+| `/ai/chat` | POST | **双层 orchestrator**：`build_prompt('assistant', user_id)` + 主模型（默认 **`chat`/`chat_stream`**，可选 **`inviteExpert: true`** → **`chat_expert_only`**）；若回复含 **`[PLAN]`**（**V9**）则解析并 **`create_task`**、正文过滤 **`[PLAN]`**；若含 **`[TOOL]`** → **`_call_tool_expert`**（内层多步 **`execute_sql`/`preview_sql`**）；专家 **`done`+`success`** 时 **`[TOOL_RESULT]`** 由 **`_format_tool_result`** 生成（**不**在此处拼任务进度；进度仅在 **`/ai/confirm`** 的 **`tool_result`**）；**SSE** 默认；**`user_id`** 时建 **`ai_sessions`** 并写 **`ai_chat`** | 可用 |
 | `/ai/memory/clean-session` | POST | 手动触发 session 清洗，要点写入 `business.ai_memory`（`scope=session`） | 可用（body：`{"session_id": <int>}`） |
 | `/ai/memory/compress-longterm` | POST | 手动触发长期记忆压缩，覆盖/写入 `scope=longterm`；成功后**顺带**调用 `extract_core_facts` 更新 `scope=core` | 可用（body：`{"user_id": <int>}`） |
 | `/ai/memory/extract-core` | POST | 仅提炼核心经验（写入 `scope=core`） | 可用（body：`{"user_id": <int>}`） |
@@ -503,7 +503,7 @@ psql -U nicjiang -d aierp -f constitution/create_meta_prompts.sql
 - **`meta.prompts`**：所有注入 LLM 的提示词模块；字段 **`agent_role`** 区分归属。`inject_mode`：`always` = 拼装进 `build_prompt(agent_role)`，`on_demand` = 仅 `build_prompt_on_demand(prompt_code)`（如记忆清洗/压缩脚本）。
 - **`business.ai_memory`**：用户级 AI 记忆（`scope`：`session` / `midterm` / `longterm` / `core`），`source_session_id` 可选指向 **`business.ai_sessions`**。
 - **`business.ai_sessions` / `business.ai_chat`**：对话会话与消息原文；持久化由 `/ai/chat` 在提供 `user_id` 时写入。
-- **`business.ai_tasks`**：**V9** 多步任务状态（`plan` JSONB、当前步、重规划次数等）；**`include_in_domain_model = false`**，由代码与 **`task_manager`** 维护，**不**注入 tool_expert。任务进度展示给主助手的入口在 **`/ai/chat`**：专家 **`done`+success** 时拼入 **`[TOOL_RESULT]`**；**`/ai/confirm`** 只更新步骤状态并落库 tool 消息。
+- **`business.ai_tasks`**：**V9** 多步任务状态（`plan` JSONB、当前步、重规划次数等）；**`include_in_domain_model = false`**，由代码与 **`task_manager`** 维护，**不**注入 tool_expert。任务进度文案给主助手的入口在 **`/ai/confirm` 响应 `tool_result`**（写入完成后注入）；**`/ai/chat`** 里专家 **`done`+success** 的 **`[TOOL_RESULT]`** **不含**进度行。
 - **`meta.role_permissions`**：角色→表级权限矩阵，**R7** 校验用。
 - **`business.user_permissions`**：个人级权限覆盖，优先于角色默认。
 - **`meta.approval_rules`**：审批规则配置（`target_type` → `approver_role`）。

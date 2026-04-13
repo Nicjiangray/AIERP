@@ -732,7 +732,8 @@ function fieldMeta(key) {
 }
 
 function labelOf(key) {
-  return fieldMeta(key)?.menu_label_cn || key
+  const m = fieldMeta(key)
+  return m?.menu_label_cn || m?.field_cn || key
 }
 
 function isBool(key) {
@@ -766,9 +767,8 @@ function parentRowProps(row) {
 }
 
 function childLabelOf(key) {
-  return (
-    childColDefs.value.find((c) => c.field_name === key)?.menu_label_cn || key
-  )
+  const c = childColDefs.value.find((x) => x.field_name === key)
+  return c?.menu_label_cn || c?.field_cn || key
 }
 
 function rowToForm(row) {
