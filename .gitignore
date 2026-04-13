@@ -16,3 +16,6 @@ frontend/dist/
 **/.DS_Store
 ~
 .memsearch.toml
+
+# 个人命令备忘，仅本地保留
+常用命令.txt
