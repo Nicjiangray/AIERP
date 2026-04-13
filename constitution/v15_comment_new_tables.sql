@@ -43,7 +43,6 @@ COMMENT ON COLUMN business.purchase_orders.supplier_id IS '供应商ID';
 COMMENT ON COLUMN business.purchase_orders.supplier_name IS '供应商名称（冗余）';
 COMMENT ON COLUMN business.purchase_orders.status IS '订单状态';
 COMMENT ON COLUMN business.purchase_orders.order_date IS '下单日期';
-COMMENT ON COLUMN business.purchase_orders.expected_delivery_date IS '预计交货日期（主表级别，明细行可能有各自交期；按行交期见 purchase_order_items.expected_delivery_date）';
 COMMENT ON COLUMN business.purchase_orders.currency IS '币种';
 COMMENT ON COLUMN business.purchase_orders.total_amount IS '订单总金额';
 COMMENT ON COLUMN business.purchase_orders.paid_amount IS '已付金额';

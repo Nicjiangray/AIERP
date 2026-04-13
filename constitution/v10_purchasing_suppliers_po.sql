@@ -47,7 +47,6 @@ CREATE TABLE IF NOT EXISTS business.purchase_orders (
     supplier_name           VARCHAR(500),
     status                  VARCHAR(30)  NOT NULL DEFAULT 'draft',
     order_date              DATE,
-    expected_delivery_date  DATE,
     currency                VARCHAR(10)  NOT NULL DEFAULT 'CNY',
     total_amount            NUMERIC(15, 2) NOT NULL DEFAULT 0,
     paid_amount             NUMERIC(15, 2) NOT NULL DEFAULT 0,

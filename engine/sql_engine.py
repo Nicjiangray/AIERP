@@ -553,6 +553,12 @@ def _audit_sql(sql: str, conn, user_id: Optional[int] = None) -> Dict[str, Any]:
     if not all_tables:
         all_tables = _collect_tables_from_statement(sqlparse.parse(one)[0])
 
+    cte_aliases = _extract_top_level_cte_aliases(bare)
+    if cte_aliases and all_tables:
+        all_tables = {
+            t for t in all_tables if t.split(".")[-1].lower() not in cte_aliases
+        }
+
     for t in all_tables:
         if t.startswith("pg_catalog.") or t.startswith("information_schema."):
             return {
@@ -652,6 +658,73 @@ def _balanced_paren_end(s: str, open_at: int) -> int:
                 return i
         i += 1
     return -1
+
+
+def _skip_sql_ws(s: str, i: int) -> int:
+    n = len(s)
+    while i < n and s[i].isspace():
+        i += 1
+    return i
+
+
+def _parse_cte_name_token(s: str, i: int) -> Tuple[Optional[str], int]:
+    """解析 WITH 子句中的 CTE 名（小写），返回 (name, 下一位置)。"""
+    i = _skip_sql_ws(s, i)
+    if i >= len(s):
+        return None, i
+    if s[i] == '"':
+        j = i + 1
+        while j < len(s):
+            if s[j] == '"' and j + 1 < len(s) and s[j + 1] == '"':
+                j += 2
+                continue
+            if s[j] == '"':
+                raw = s[i + 1 : j].replace('""', '"')
+                return raw.lower(), j + 1
+            j += 1
+        return None, i
+    m = re.match(r"[a-zA-Z_][\w]*", s[i:])
+    if not m:
+        return None, i
+    return m.group(0).lower(), i + m.end()
+
+
+def _extract_top_level_cte_aliases(bare: str) -> Set[str]:
+    """
+    解析顶层 WITH 中的 CTE 别名（小写裸名）。
+    用于排除 FROM/JOIN 误将 CTE 名当作真实表（如 business.new_po）导致的白名单误判。
+    """
+    s = bare.strip()
+    if not s:
+        return set()
+    m = re.match(r"^\s*WITH\s+(?:RECURSIVE\s+)?", s, re.IGNORECASE)
+    if not m:
+        return set()
+    i = m.end()
+    out: Set[str] = set()
+    while True:
+        name, i = _parse_cte_name_token(s, i)
+        if not name:
+            break
+        i = _skip_sql_ws(s, i)
+        m_as = re.match(r"AS\b", s[i:], re.IGNORECASE)
+        if not m_as:
+            break
+        i += m_as.end()
+        i = _skip_sql_ws(s, i)
+        if i >= len(s) or s[i] != "(":
+            break
+        close = _balanced_paren_end(s, i)
+        if close < 0:
+            break
+        out.add(name)
+        i = close + 1
+        i = _skip_sql_ws(s, i)
+        if i < len(s) and s[i] == ",":
+            i += 1
+            continue
+        break
+    return out
 
 
 def _mask_sql_function_internal_from_clauses(sql: str) -> str:

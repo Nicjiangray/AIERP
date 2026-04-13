@@ -111,3 +111,17 @@ systemctl restart aierp 重启服务
 每次 ssh 若未配置密钥，会按提示输入密码（可能多次，属正常现象）。
 
 以后若你在 ~/.ssh/config 里配好密钥，同一脚本可继续用，一般不再问密码。若你云端服务名不是 aierp，把脚本里的 systemctl restart aierp 改成实际 unit 名即可。
+
+
+一键同步本地和云端：
+以后的日常流程也就是：本地改完 
+→git push 
+→ SSH 上去 git pull + venv/bin/python scripts/migrate.py--password Sirui1512，
+一条命令搞定迁移 + schema 同步。
+
+走 SSH 方案：
+
+ssh root@47.86.34.90
+cd /home/AIERP
+venv/bin/python scripts/seed_migrations.py --password Sirui1512
+venv/bin/python scripts/migrate.py --password Sirui1512

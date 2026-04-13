@@ -728,7 +728,8 @@ async def _call_tool_expert_recover_after_failed_confirm(
             "用户已确认过预览，但数据库执行或执行后校验未通过。"
             "请根据错误信息修正 SQL，重新输出 write（可多条），并以 done+summary 结束；"
             "仅一条 write 时可直接形成新预览。"
-            "若「原始助手意图」中要求合同行项目/数量/产品，必须一并写入 contract_items，不可只写 contracts 主表。"
+            "若「原始助手意图」要求主从表一并写入（如合同与行表、采购单与明细），须保证 batch 覆盖所有相关表，"
+            "不可只写主表。"
             "若 上次执行引擎返回 中 error_type 为 dependency_missing：请把 message 原样转告用户，"
             "并引导用户先在关联主数据（如员工、部门）中建立对应记录后再操作，勿盲目重试同一 SQL。"
         ),
@@ -2021,30 +2022,13 @@ def verify_batch_matches_tool_intent(
     tool_context: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """
-    执行前检查：若意图明确包含合同行项目，则 batch 须出现 contract_items 相关写入。
-    避免主表 INSERT 已成功、子表从未生成却显示「完成任务」。
+    执行前意图与 SQL 一致性检查（预留扩展点）。
+
+    历史上曾用「合同 + 行项目关键词 → 必须写 contract_items」做启发式校验，会把采购单明细等场景误判为缺表，
+    且与 CTE 主子表写法冲突。主从完整性改由 tool_expert 与业务侧保证，此处不再做硬编码表名对照。
     """
-    if not tool_context or not isinstance(tool_context, dict):
-        return {"ok": True, "reason": ""}
-    details = str(tool_context.get("details") or "")
-    action = str(tool_context.get("action") or "").lower()
-    intent = str(tool_context.get("intent") or "")
-    blob = f"{action} {intent} {details}"
-    if "合同" not in blob and "contract" not in blob.lower():
-        return {"ok": True, "reason": ""}
-    line_hints = ("数量", "米", "产品", "单价", "金额", "明细", "行项目")
-    if not any(h in details for h in line_hints):
-        return {"ok": True, "reason": ""}
-    sql_joined = " ".join((x.get("sql") or "").lower() for x in batch)
-    if "contract_items" in sql_joined:
-        return {"ok": True, "reason": ""}
-    return {
-        "ok": False,
-        "reason": (
-            "意图（details）包含合同行项目信息，但当前待执行 SQL 未写入 business.contract_items；"
-            "请生成含主表与子表的完整 batch（可用 CTE 多语句或顺序 INSERT）。"
-        ),
-    }
+    _ = (batch, tool_context)
+    return {"ok": True, "reason": ""}
 
 
 def _batch_from_write_preview(expert_out: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:

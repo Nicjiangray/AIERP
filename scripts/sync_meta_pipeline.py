@@ -12,6 +12,10 @@
   .venv/bin/python scripts/sync_meta_pipeline.py --skip-meta-cn          # 已有人工 field_cn，只同步库结构+prompt
   .venv/bin/python scripts/sync_meta_pipeline.py --only-schema-shadow    # 仅重写 prompts（meta 已就绪）
 
+数据库连接与 ``tools.database.db_conn`` 一致，读环境变量：
+``PGHOST``、``PGPORT``、``PGUSER``、``PGDATABASE``、``PG_API_PASSWORD``。
+从本机连云端时先 ``export PGHOST=...``（或 ``migrate.py`` 会在子进程里自动传入上述变量）。
+
 单独脚本仍可直接运行：sync_constitution 仅能通过 psql/CALL，其余见各文件说明。
 """
 

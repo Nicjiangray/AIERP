@@ -112,7 +112,7 @@
 - **采购**：`suppliers`（供应商）、`purchase_orders`、`purchase_order_items`（含 `delivered_qty`、`source_contract_item_id` 等）  
 - **物流**：`receiving_notes`、`receiving_note_items`（到货）；`shipping_notes`、`shipping_note_items`（发货；明细可关联 `inventory_id`）  
 - **收付款与库存**：`payments`、`payment_allocations`；`inventory`（按产品/批次等）  
-- **字段修订**：`contract_items.expected_delivery_date`、`purchase_order_items.expected_delivery_date`（交期下钻子表；主表交期列保留但标注弃用）；`contract_items.shipped_qty`；`contracts.received_amount`  
+- **字段修订**：`contract_items.expected_delivery_date`、`purchase_order_items.expected_delivery_date`（交期仅子表；主表交期列已由 **`v36_drop_main_table_delivery_columns.sql`** 删除）；`contract_items.shipped_qty`；`contracts.received_amount`  
 
 **Orchestrator**
 
@@ -132,6 +132,7 @@
 | **`nav_purchasing_tables.sql`** | `meta.meta_tables` 导航：采购主从表等 |
 | **`v11_receiving_shipping_tables.sql`** | 到货单/发货单四表 + `contract_items.shipped_qty` |
 | **`v12_payments_inventory_delivery_fix.sql`** | 收付款、分配、库存、`shipping_note_items.inventory_id`、交期迁移、`contracts.received_amount`；末尾含 `sync_constitution` 与导航更新 |
+| **`v36_drop_main_table_delivery_columns.sql`** | 删除 `contracts.delivery_date`、`purchase_orders.expected_delivery_date`；交期仅保留在明细行 |
 | **`v13_role_rules_multistep_orchestrator.sql`** | `role_rules` 追加多步骤任务规则 |
 | **`v14_ai_memory_scope_core_and_prompt.sql`** | `ai_memory` 允许 **`core`**；`memory_core_extract` 提示词 |
 
