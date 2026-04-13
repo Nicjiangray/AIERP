@@ -295,15 +295,14 @@ aierp/
 │   └── src/                # 实际使用的页面与组件（见「前端现状」）
 ├── dev.sh                  # 一键前后端
 ├── requirements.txt
-├── README.md
-└── 常用命令.txt
+└── README.md
 ```
 
 `frontend/` 根目录下另有若干与 `frontend/src/` **同名或重复的 .vue / main.js**（历史拷贝），**以 `frontend/src/` 与 `index.html` 引用的 `/src/main.js` 为准**。
 
 ---
 
-本文档用于**快速回忆**：日常命令、迁移顺序、代码与接口现状。更细的命令备忘见 [`常用命令.txt`](./常用命令.txt)。
+本文档用于**快速回忆**：日常命令、迁移顺序、代码与接口现状。数据库迁移与元数据同步见下文「元数据流水线」与 `scripts/migrate.py` / `scripts/seed_migrations.py`。
 
 ---
 
@@ -426,8 +425,6 @@ aierp/
 ```bash
 .venv/bin/python scripts/sync_meta_pipeline.py
 ```
-
-等价于「宪法 + 中文名」的旧脚本若仍存在，见 [`常用命令.txt`](./常用命令.txt)。
 
 常用参数：
 

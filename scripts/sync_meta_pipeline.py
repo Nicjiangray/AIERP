@@ -12,9 +12,9 @@
   .venv/bin/python scripts/sync_meta_pipeline.py --skip-meta-cn          # 已有人工 field_cn，只同步库结构+prompt
   .venv/bin/python scripts/sync_meta_pipeline.py --only-schema-shadow    # 仅重写 prompts（meta 已就绪）
 
-数据库连接与 ``tools.database.db_conn`` 一致，读环境变量：
-``PGHOST``、``PGPORT``、``PGUSER``、``PGDATABASE``、``PG_API_PASSWORD``。
-从本机连云端时先 ``export PGHOST=...``（或 ``migrate.py`` 会在子进程里自动传入上述变量）。
+数据库连接与 ``tools.database`` 一致（API 池与 LLM 池）。在**首次** ``import tools.database``
+之前会从仓库根目录加载 ``.env``（``python-dotenv``），以便子进程也能读到 ``PG_LLM_PASSWORD`` 等仅写在文件里的变量；
+已存在的环境变量（如 ``migrate.py`` 传入的 ``PGHOST``）不会被覆盖。
 
 单独脚本仍可直接运行：sync_constitution 仅能通过 psql/CALL，其余见各文件说明。
 """
@@ -27,6 +27,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = Path(__file__).resolve().parent
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(ROOT / ".env")
+except ImportError:
+    pass
 
 for p in (ROOT, SCRIPTS):
     s = str(p)
