@@ -95,18 +95,24 @@ def ensure_migrations_table(conn) -> None:
 def os_environ_for_db(
     host: str,
     port: int,
-    user: str,
     password: str,
     dbname: str,
 ) -> dict:
     """
-    供 migrate.py 调用 sync_meta_pipeline 子进程时使用，与 tools.database._api_pg_kwargs 键一致，
-    使 pipeline 与迁移连同一实例（避免 --host 指云端时子进程仍连 localhost）。
+    供 migrate.py 调用 sync_meta_pipeline 子进程时使用。
+
+    只覆盖 PGHOST、PGPORT、PGDATABASE、PG_API_PASSWORD（与迁移目标实例一致）。
+    **绝不**写入 PGUSER（无此参数；若曾写 env['PGUSER'] 会导致 API/LLM 两池共用一个账号）。
+
+    从父进程 copy 后会 pop 掉 PGUSER，避免 shell 里 export 的 PGUSER=nicjiang 进入子进程，
+    使 database.py 中 API 池默认 user=nicjiang、LLM 池默认 user=llm_assistant（各看各自的 PGUSER 缺省）。
+    子进程内 sync_meta_pipeline 会先 load_dotenv(.env)；若 .env 里仍设了 PGUSER，会再次污染两池，
+    此时应去掉 .env 的全局 PGUSER，或后续在 database.py 拆分为独立变量。
     """
     env = os.environ.copy()
+    env.pop("PGUSER", None)
     env["PGHOST"] = host
     env["PGPORT"] = str(port)
-    env["PGUSER"] = user
     env["PGDATABASE"] = dbname
     env["PG_API_PASSWORD"] = password or ""
     return env

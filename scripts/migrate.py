@@ -150,7 +150,6 @@ def main() -> int:
             env=os_environ_for_db(
                 args.host,
                 args.port,
-                args.user,
                 args.password,
                 args.db,
             ),
