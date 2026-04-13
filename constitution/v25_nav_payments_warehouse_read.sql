@@ -3,7 +3,7 @@
 -- 幂等：ON CONFLICT 更新
 -- 执行：psql -d aierp -f constitution/v25_nav_payments_warehouse_read.sql
 
-INSERT INTO meta.role_permissions (role_code, table_name, can_read, can_write, can_delete)
+INSERT INTO business.role_permissions (role_code, table_name, can_read, can_write, can_delete)
 VALUES ('warehouse', 'business.payments', true, false, false)
 ON CONFLICT (role_code, table_name) DO UPDATE SET
   can_read = EXCLUDED.can_read,

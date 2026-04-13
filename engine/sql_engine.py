@@ -13,10 +13,10 @@ import bcrypt
 
 logger = logging.getLogger(__name__)
 
-# 拥有全表权限的角色（与 meta.role_permissions 中 admin 种子一致；含历史 super_admin）
+# 拥有全表权限的角色（与 business.role_permissions 中 admin 种子一致；含历史 super_admin）
 _PRIVILEGED_ROLES = frozenset({"admin", "super_admin"})
 
-# INSERT 成功后需自动建审批单的业务表 → meta.approval_rules.target_type
+# INSERT 成功后需自动建审批单的业务表 → business.approval_rules.target_type
 _TABLE_TO_APPROVAL_TARGET: Dict[str, str] = {
     "business.contracts": "contract",
     "business.purchase_orders": "purchase_order",
@@ -147,7 +147,7 @@ def _check_table_permission(
     with conn.cursor() as cur:
         cur.execute(
             f"""
-            SELECT 1 FROM meta.role_permissions
+            SELECT 1 FROM business.role_permissions
             WHERE role_code = ANY(%s)
               AND LOWER(table_name) = %s
               AND {col} = true
@@ -241,7 +241,7 @@ def _maybe_create_approval(
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT approver_role FROM meta.approval_rules
+            SELECT approver_role FROM business.approval_rules
             WHERE target_type = %s AND is_active = true
               AND (condition_expr IS NULL OR TRIM(condition_expr) = '')
             LIMIT 1

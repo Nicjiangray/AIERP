@@ -1,7 +1,7 @@
 -- 将 business 业务主表挂入侧栏；子表明细不出现在左侧栏（仅主表）
 -- 系统准备含「联系人」；系统运行区顺序：合同管理 → 合同变更 → 采购 → 收付款 → 到货 → 发货 → 库存；其后审批单
 -- 增量修正见 v26 / v27（已跑过 v23 的库按需执行）
--- 之后「谁可见」仍由 meta.role_permissions / business.user_permissions 控制
+-- 之后「谁可见」仍由 business.role_permissions / business.user_permissions 控制
 -- 执行：psql -d aierp -f constitution/v23_business_nav_all_tables.sql
 
 BEGIN;
@@ -196,7 +196,7 @@ COMMIT;
 -- ---------------------------------------------------------------------------
 -- admin：对全部 business 表保留完整 role_permissions（子表仍可有权限，便于 SQL/界面）
 -- ---------------------------------------------------------------------------
-INSERT INTO meta.role_permissions (role_code, table_name, can_read, can_write, can_delete)
+INSERT INTO business.role_permissions (role_code, table_name, can_read, can_write, can_delete)
 SELECT
     'admin',
     'business.' || tablename,

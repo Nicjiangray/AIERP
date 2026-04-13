@@ -133,6 +133,7 @@
 | **`v11_receiving_shipping_tables.sql`** | 到货单/发货单四表 + `contract_items.shipped_qty` |
 | **`v12_payments_inventory_delivery_fix.sql`** | 收付款、分配、库存、`shipping_note_items.inventory_id`、交期迁移、`contracts.received_amount`；末尾含 `sync_constitution` 与导航更新 |
 | **`v36_drop_main_table_delivery_columns.sql`** | 删除 `contracts.delivery_date`、`purchase_orders.expected_delivery_date`；交期仅保留在明细行 |
+| **`v37_move_permission_tables_to_business.sql`** | 旧库将 `meta` 下的 `approval_rules` / `role_permissions` 迁入 `business`；`meta.prompts` 内旧表名替换；新版 v17 已建在 `business` 则跳过迁移 |
 | **`v13_role_rules_multistep_orchestrator.sql`** | `role_rules` 追加多步骤任务规则 |
 | **`v14_ai_memory_scope_core_and_prompt.sql`** | `ai_memory` 允许 **`core`**；`memory_core_extract` 提示词 |
 
@@ -150,17 +151,17 @@
 
 **权限管理**
 
-- **角色表级权限**：`meta.role_permissions`（role_code → table_name → can_read/write/delete）；`sql_engine.py` 新增 R7 规则
+- **角色表级权限**：`business.role_permissions`（role_code → table_name → can_read/write/delete）；`sql_engine.py` 新增 R7 规则
 - **个人权限覆盖**：`business.user_permissions`（employee_id → table_name），优先级高于角色默认；支持加权和减权
 - **主管数据可见**：`employees.manager_id` + prompt 注入下属列表和 `owner_id IN (...)` 条件
 - **动态菜单**：`GET /api/user-menu?user_id=`，合并个人+角色权限，前端 DataNavPanel 改用此接口驱动
 - **业务表 owner_id**：`customers`、`contracts`、`purchase_orders`、`shipping_notes` 新增 `owner_id`
-- 4 个角色：admin / sales / warehouse / finance，权限矩阵见 `meta.role_permissions` 种子数据
+- 4 个角色：admin / sales / warehouse / finance，权限矩阵见 `business.role_permissions` 种子数据
 
 **审批流**
 
 - `business.approvals`：审批记录（target_type、target_id、requested_by、approver_id、status、comment）
-- `meta.approval_rules`：审批规则配置（target_type → approver_role）
+- `business.approval_rules`：审批规则配置（target_type → approver_role）
 - 合同和采购订单 INSERT 成功后自动创建审批记录，status 设为 `pending_approval`
 - `GET /approvals/pending?user_id=` + `POST /approvals/{id}/decide`
 - 审批通过后统一设为 `active`，下游只认 `active` 状态
@@ -475,7 +476,7 @@ aierp/
 | **`v20_role_rules_self_intro.sql`** | **V7**：`role_rules` 追加自我介绍 |
 | **`v21_role_rules_self_intro_wording.sql`** | **V7**：自我介绍措辞修订（可选） |
 | **`v22_incidents_and_feedback.sql`** | **V7**：`ai_incidents` + `ai_feedback`，`include_in_domain_model=false` |
-| **`v23_business_nav_all_tables.sql`** | **V7+**：侧栏**不含子表明细**；`run` 顺序为销售合同→采购→到货→发货→库存→资金；**admin** `role_permissions` 全表补齐 |
+| **`v23_business_nav_all_tables.sql`** | **V7+**：侧栏**不含子表明细**；`run` 顺序为销售合同→采购→到货→发货→库存→资金；**admin** `business.role_permissions` 全表补齐 |
 | **`v25_nav_payments_warehouse_read.sql`** | **V7+**：`warehouse` 补 **`business.payments`** 读权限（v17 遗漏）；保证侧栏出现收付款 |
 | **`v26_nav_run_order_main_only.sql`** | **V7+**：侧栏**仅主表**；`prep` 含**联系人**；`run` 以**合同管理**（`contracts`）为首→变更→采购→收付款→到货→发货→库存；**`/api/user-menu`** 排除子表导航 |
 | **`v27_nav_contacts_prep_contracts_first_run.sql`** | **V7+**：曾执行**旧** v26 的库：联系人回 prep、`contracts` 置顶 run |
@@ -502,9 +503,9 @@ psql -U nicjiang -d aierp -f constitution/create_meta_prompts.sql
 - **`business.ai_memory`**：用户级 AI 记忆（`scope`：`session` / `midterm` / `longterm` / `core`），`source_session_id` 可选指向 **`business.ai_sessions`**。
 - **`business.ai_sessions` / `business.ai_chat`**：对话会话与消息原文；持久化由 `/ai/chat` 在提供 `user_id` 时写入。
 - **`business.ai_tasks`**：**V9** 多步任务状态（`plan` JSONB、当前步、重规划次数等）；**`include_in_domain_model = false`**，由代码与 **`task_manager`** 维护，**不**注入 tool_expert。任务进度文案给主助手的入口在 **`/ai/confirm` 响应 `tool_result`**（写入完成后注入）；**`/ai/chat`** 里专家 **`done`+success** 的 **`[TOOL_RESULT]`** **不含**进度行。
-- **`meta.role_permissions`**：角色→表级权限矩阵，**R7** 校验用。
+- **`business.role_permissions`**：角色→表级权限矩阵，**R7** 校验用。
 - **`business.user_permissions`**：个人级权限覆盖，优先于角色默认。
-- **`meta.approval_rules`**：审批规则配置（`target_type` → `approver_role`）。
+- **`business.approval_rules`**：审批规则配置（`target_type` → `approver_role`）。
 - **`business.approvals`**：审批记录。
 - **`business.dashboard_cards`**：仪表盘卡片配置，存 SQL，前端经 **`/api/dashboard`** 由引擎执行。
 - **`business.ai_incidents`**：系统错误自动记录（`include_in_domain_model=false`，expert 不可见）。

@@ -4,9 +4,9 @@
 BEGIN;
 
 -- ---------------------------------------------------------------------------
--- 1) meta.role_permissions
+-- 1) business.role_permissions
 -- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS meta.role_permissions (
+CREATE TABLE IF NOT EXISTS business.role_permissions (
     id SERIAL PRIMARY KEY,
     role_code VARCHAR(30) NOT NULL,
     table_name VARCHAR(100) NOT NULL,
@@ -19,12 +19,12 @@ CREATE TABLE IF NOT EXISTS meta.role_permissions (
     UNIQUE(role_code, table_name)
 );
 
-COMMENT ON TABLE meta.role_permissions IS '角色-表级权限矩阵：定义每个角色对每张业务表的读/写/删权限';
+COMMENT ON TABLE business.role_permissions IS '角色-表级权限矩阵：定义每个角色对每张业务表的读/写/删权限';
 
 -- ---------------------------------------------------------------------------
--- 2) meta.approval_rules
+-- 2) business.approval_rules
 -- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS meta.approval_rules (
+CREATE TABLE IF NOT EXISTS business.approval_rules (
     id SERIAL PRIMARY KEY,
     target_type VARCHAR(30) NOT NULL,
     condition_expr TEXT,
@@ -34,9 +34,9 @@ CREATE TABLE IF NOT EXISTS meta.approval_rules (
     UNIQUE (target_type, condition_expr)
 );
 
-COMMENT ON TABLE meta.approval_rules IS '审批规则配置：哪些单据类型需要审批、由什么角色审批；condition_expr 空串表示全部单据';
+COMMENT ON TABLE business.approval_rules IS '审批规则配置：哪些单据类型需要审批、由什么角色审批；condition_expr 空串表示全部单据';
 
-INSERT INTO meta.approval_rules (target_type, condition_expr, approver_role, notes) VALUES
+INSERT INTO business.approval_rules (target_type, condition_expr, approver_role, notes) VALUES
 ('contract', '', 'admin', '所有销售合同需管理员审批'),
 ('purchase_order', '', 'admin', '所有采购订单需管理员审批')
 ON CONFLICT (target_type, condition_expr) DO NOTHING;
@@ -88,7 +88,7 @@ COMMENT ON COLUMN business.purchase_orders.status IS 'draft / pending_approval /
 -- ---------------------------------------------------------------------------
 -- 5) 角色权限种子（admin：全 business 表）
 -- ---------------------------------------------------------------------------
-INSERT INTO meta.role_permissions (role_code, table_name, can_read, can_write, can_delete)
+INSERT INTO business.role_permissions (role_code, table_name, can_read, can_write, can_delete)
 SELECT 'admin', schemaname || '.' || tablename, true, true, true
 FROM pg_tables
 WHERE schemaname = 'business'
@@ -99,7 +99,7 @@ ON CONFLICT (role_code, table_name) DO UPDATE SET
     can_delete = EXCLUDED.can_delete,
     updated_at = now();
 
-INSERT INTO meta.role_permissions (role_code, table_name, can_read, can_write, can_delete) VALUES
+INSERT INTO business.role_permissions (role_code, table_name, can_read, can_write, can_delete) VALUES
 ('sales', 'business.customers', true, true, false),
 ('sales', 'business.contacts', true, true, false),
 ('sales', 'business.contracts', true, true, false),
@@ -120,7 +120,7 @@ INSERT INTO meta.role_permissions (role_code, table_name, can_read, can_write, c
 ON CONFLICT (role_code, table_name) DO UPDATE SET
     can_read = EXCLUDED.can_read, can_write = EXCLUDED.can_write, can_delete = EXCLUDED.can_delete, updated_at = now();
 
-INSERT INTO meta.role_permissions (role_code, table_name, can_read, can_write, can_delete) VALUES
+INSERT INTO business.role_permissions (role_code, table_name, can_read, can_write, can_delete) VALUES
 ('warehouse', 'business.receiving_notes', true, true, false),
 ('warehouse', 'business.receiving_note_items', true, true, false),
 ('warehouse', 'business.inventory', true, true, false),
@@ -138,7 +138,7 @@ INSERT INTO meta.role_permissions (role_code, table_name, can_read, can_write, c
 ON CONFLICT (role_code, table_name) DO UPDATE SET
     can_read = EXCLUDED.can_read, can_write = EXCLUDED.can_write, can_delete = EXCLUDED.can_delete, updated_at = now();
 
-INSERT INTO meta.role_permissions (role_code, table_name, can_read, can_write, can_delete) VALUES
+INSERT INTO business.role_permissions (role_code, table_name, can_read, can_write, can_delete) VALUES
 ('finance', 'business.payments', true, true, false),
 ('finance', 'business.payment_allocations', true, true, false),
 ('finance', 'business.customers', true, false, false),
